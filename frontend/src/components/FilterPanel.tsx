@@ -19,9 +19,7 @@ export interface AiHighlights {
 interface FilterPanelProps {
   filters: FiltersState;
   onFiltersChange: (filters: FiltersState) => void;
-  onApply: () => void;
   onClear: () => void;
-  loading: boolean;
   aiHighlights?: AiHighlights;
   onClearAiFilters?: () => void;
 }
@@ -263,9 +261,7 @@ function sectionActiveCount(section: string, f: FiltersState): number {
 export default function FilterPanel({
   filters,
   onFiltersChange,
-  onApply,
   onClear,
-  loading,
   aiHighlights,
   onClearAiFilters,
 }: FilterPanelProps) {
@@ -584,9 +580,6 @@ export default function FilterPanel({
       {/* ── Buttons ─────────────────────────────────────────────────── */}
       <div className="filter-buttons">
         <button onClick={onClear} className="btn btn-secondary">Clear All</button>
-        <button onClick={onApply} disabled={loading} className="btn btn-primary">
-          {loading ? 'Searching…' : 'Apply Filters'}
-        </button>
       </div>
     </div>
   );

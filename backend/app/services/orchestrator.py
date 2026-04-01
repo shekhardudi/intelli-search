@@ -435,9 +435,9 @@ class SearchOrchestrator:
         logger.info(
             "filters_merged",
             intent=intent_category.value,
-            classifier_keys=list(intent_filters.keys()),
-            user_keys=list(normalised_user.keys()),
-            merged_keys=list(merged.keys()),
+            classifier_filters=intent_filters,
+            user_filters=normalised_user,
+            merged_filters=merged,
         )
         return merged
 

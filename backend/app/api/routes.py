@@ -167,6 +167,13 @@ async def intelligent_search(
         _metrics["active_search_requests"].add(1)
         _t0 = _time.perf_counter()
         try:
+            user_filter_dict = request.filters.model_dump(exclude_none=True) if request.filters else {}
+            logger.info(
+                "user_filters_received",
+                query=request.query[:100],
+                has_filters=bool(user_filter_dict),
+                filters=user_filter_dict,
+            )
             _search_fn = functools.partial(
                 orchestrator.search,
                 request.query,
@@ -174,7 +181,7 @@ async def intelligent_search(
                 request.page,
                 trace_id,
                 request.include_reasoning,
-                request.filters.model_dump(exclude_none=True) if request.filters else {},
+                user_filter_dict,
             )
             orch_response = await asyncio.wait_for(
                 asyncio.get_running_loop().run_in_executor(_THREAD_POOL, _search_fn),

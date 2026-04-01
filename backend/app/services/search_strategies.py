@@ -181,6 +181,13 @@ class SearchStrategy(ABC):
         if size := filters.get("size_range"):
             clauses.append({"term": {"size_range": size}})
 
+        if clauses:
+            logger.info(
+                "opensearch_filter_clauses_built",
+                num_clauses=len(clauses),
+                filter_keys=[k for k in filters.keys() if filters.get(k)],
+            )
+
         return clauses
 
 
@@ -301,6 +308,13 @@ class RegularSearchStrategy(SearchStrategy):
             })
 
         filter_clauses = self._build_filters(context.filters)
+        logger.info(
+            "search_filters_applied",
+            strategy="regular",
+            trace_id=context.trace_id,
+            raw_filters=context.filters,
+            num_filter_clauses=len(filter_clauses),
+        )
         bool_query: Dict[str, Any] = {
             "must": must_clauses if must_clauses else [{"match_all": {}}],
             "filter": filter_clauses,
@@ -666,6 +680,13 @@ class SemanticSearchStrategy(SearchStrategy):
     def _build_bm25_query(self, context: SearchContext) -> Dict[str, Any]:
         """BM25 leg — multi_match with LLM-extracted field boosts + filters."""
         filter_clauses = self._build_filters(context.filters)
+        logger.info(
+            "search_filters_applied",
+            strategy="semantic_bm25_leg",
+            trace_id=context.trace_id,
+            raw_filters=context.filters,
+            num_filter_clauses=len(filter_clauses),
+        )
         effective_boosts = self._resolve_field_boosts(context)
         boosted_fields = self._boosts_to_fields(effective_boosts)
 
@@ -695,6 +716,13 @@ class SemanticSearchStrategy(SearchStrategy):
         at the ANN candidate selection stage for efficiency.
         """
         filter_clauses = self._build_filters(context.filters)
+        logger.info(
+            "search_filters_applied",
+            strategy="semantic_knn_leg",
+            trace_id=context.trace_id,
+            raw_filters=context.filters,
+            num_filter_clauses=len(filter_clauses),
+        )
 
         rrf_cfg = get_search_config().get("rrf", {})
         knn_params: Dict[str, Any] = {

@@ -634,10 +634,15 @@ const CHIP_ICON: Record<IntentChip['type'], string> = {
 
 export default function App() {
   const [query, setQuery] = useState('');
+  const queryRef = useRef(query);
+  const inputRef = useRef<HTMLInputElement>(null);
   const [results, setResults] = useState<IntelligentSearchResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [currentPage, setCurrentPage] = useState(1);
   const [filters, setFilters] = useState<FiltersState>(EMPTY_FILTERS);
+
+  // Mobile sidebar state
+  const [sidebarOpen, setSidebarOpen] = useState(false);
 
   // AI thinking animation state
   const [searchPhase, setSearchPhase] = useState<SearchPhase>('classifying');
@@ -649,6 +654,11 @@ export default function App() {
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [activeSuggestion, setActiveSuggestion] = useState(-1);
 
+  // Track whether user has searched at least once (for auto-apply)
+  const hasSearchedRef = useRef(false);
+  // Suppress autocomplete after selecting a suggestion or submitting
+  const suppressSuggestionsRef = useRef(false);
+
   // Ghost chips + AI glow (Pillars A + B)
   const [ghostChips, setGhostChips] = useState<IntentChip[]>([]);
   const [aiGlowing, setAiGlowing] = useState(false);
@@ -657,9 +667,10 @@ export default function App() {
   const glowTimerRef = useRef<number | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
-  // Update ghost chips as user types (Pillar A)
+  // Update ghost chips as user types (Pillar A) — debounced to avoid lag
   useEffect(() => {
-    setGhostChips(extractChips(query));
+    const timer = setTimeout(() => setGhostChips(extractChips(query)), 200);
+    return () => clearTimeout(timer);
   }, [query]);
 
   // Advance through search phases while loading
@@ -685,6 +696,10 @@ export default function App() {
 
   // Debounced autocomplete suggestions
   useEffect(() => {
+    if (suppressSuggestionsRef.current) {
+      suppressSuggestionsRef.current = false;
+      return;
+    }
     if (!query.trim() || query.length < 2) {
       setSuggestions([]);
       setShowSuggestions(false);
@@ -698,6 +713,13 @@ export default function App() {
     }, 300);
     return () => clearTimeout(timer);
   }, [query]);
+
+  // Lightweight handler — only update ref + state, no heavy work
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const v = e.target.value;
+    queryRef.current = v;
+    setQuery(v);
+  };
 
   const toApiFilters = (f: FiltersState): UserFilters => {
     const out: UserFilters = {};
@@ -749,10 +771,15 @@ export default function App() {
     } finally {
       if (!signal.aborted) setLoading(false);
     }
+    hasSearchedRef.current = true;
   };
 
   const selectSuggestion = (s: string) => {
+    suppressSuggestionsRef.current = true;
+    queryRef.current = s;
     setQuery(s);
+    if (inputRef.current) inputRef.current.value = s;
+    setSuggestions([]);
     setShowSuggestions(false);
     setActiveSuggestion(-1);
     setCurrentPage(1);
@@ -775,15 +802,23 @@ export default function App() {
     }
   };
 
+  // Auto-apply filters with debounce after initial search
+  useEffect(() => {
+    if (!hasSearchedRef.current || !query.trim()) return;
+    const timer = setTimeout(() => {
+      setCurrentPage(1);
+      runSearch(query, 1, filters);
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [filters]);
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    suppressSuggestionsRef.current = true;
+    setSuggestions([]);
     setShowSuggestions(false);
     setCurrentPage(1);
-    runSearch(query, 1, filters);
-  };
-
-  const handleApplyFilters = () => {
-    setCurrentPage(1);
+    setSidebarOpen(false);
     runSearch(query, 1, filters);
   };
 
@@ -801,7 +836,9 @@ export default function App() {
   };
 
   const handleBrandClick = () => {
+    queryRef.current = '';
     setQuery('');
+    if (inputRef.current) inputRef.current.value = '';
     setResults(null);
     setFilters(EMPTY_FILTERS);
     setCurrentPage(1);
@@ -823,6 +860,14 @@ export default function App() {
       {/* ── Sticky top nav with omnibox ── */}
       <header className="top-nav">
         <div className="top-nav-inner">
+          <button
+            type="button"
+            className="hamburger-btn"
+            onClick={() => setSidebarOpen(o => !o)}
+            aria-label="Toggle filters"
+          >
+            <span className="hamburger-icon" />
+          </button>
           <button type="button" className="top-nav-brand" onClick={handleBrandClick}>
             Intelli-Search
           </button>
@@ -831,16 +876,19 @@ export default function App() {
             <form className="omnibox" onSubmit={handleSubmit}>
               <span className="omnibox-icon">🔍</span>
               <input
+                ref={inputRef}
                 type="text"
                 value={query}
-                onChange={e => setQuery(e.target.value)}
+                onChange={handleInputChange}
                 onKeyDown={handleKeyDown}
                 onFocus={() => suggestions.length > 0 && setShowSuggestions(true)}
                 onBlur={() => setTimeout(() => setShowSuggestions(false), 150)}
                 placeholder='Search companies… e.g. "tech startups in California"'
                 className="omnibox-input"
-                disabled={loading}
                 autoComplete="off"
+                spellCheck={false}
+                autoCorrect="off"
+                autoCapitalize="off"
               />
               <button
                 type="submit"
@@ -881,14 +929,17 @@ export default function App() {
       </header>
 
       <div className="dashboard">
+        {/* Mobile overlay */}
+        {sidebarOpen && (
+          <div className="sidebar-overlay" onClick={() => setSidebarOpen(false)} />
+        )}
+
         {/* Sidebar: filters only */}
-        <aside className="sidebar">
+        <aside className={`sidebar${sidebarOpen ? ' sidebar--open' : ''}`}>
           <FilterPanel
             filters={filters}
             onFiltersChange={setFilters}
-            onApply={handleApplyFilters}
             onClear={handleClearFilters}
-            loading={loading}
             aiHighlights={{
               industries: aiDetectedIndustries,
               country: aiDetectedCountry,
