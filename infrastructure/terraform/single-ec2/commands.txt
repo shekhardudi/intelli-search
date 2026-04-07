@@ -1,0 +1,26 @@
+cd infrastructure/terraform/single-ec2
+cp terraform.tfvars.example terraform.tfvars   # fill in real values
+terraform init
+terraform plan
+terraform apply
+./deploy.sh                    # SSM mode (no SSH key needed)
+./deploy.sh --ssh -i ~/.ssh/key.pem   # SSH mode
+
+
+# 1. After terraform apply, upload data to S3
+tar czf /tmp/data-pipeline.tar.gz -C data-pipeline .
+aws s3 cp /tmp/data-pipeline.tar.gz s3://$(terraform output -raw data_bucket_name)/data-pipeline.tar.gz
+aws s3 cp data-pipeline/companies_sorted.csv s3://$(terraform output -raw data_bucket_name)/companies_sorted.csv
+
+# 2. Launch ingestion (auto-terminates when done)
+./run-ingest.sh
+
+# 3. Check status / logs
+./run-ingest.sh --status
+./run-ingest.sh --stop
+
+
+./manage-instance.sh stop      # Stop EC2 (EIP preserved, saves compute cost)
+./manage-instance.sh start     # Start EC2, wait for SSM + all 4 containers healthy
+./manage-instance.sh restart   # Stop then start
+./manage-instance.sh status 
