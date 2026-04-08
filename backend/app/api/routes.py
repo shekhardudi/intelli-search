@@ -3,11 +3,13 @@ API route handlers for intelligent search endpoints.
 Uses the new orchestrator-based architecture with intent classification,
 strategy routing, and hybrid search.
 """
+import asyncio
 import functools
+import json
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import APIRouter, Query, HTTPException, Header, Response
-from typing import List, Optional, Dict, Any
-import asyncio
+from fastapi.responses import StreamingResponse
+from typing import Any, Callable, Dict, List, Optional
 import structlog
 from pydantic import BaseModel, Field
 
@@ -244,6 +246,106 @@ async def intelligent_search(
             status_code=500,
             detail="Search failed. See server logs for details."
         )
+
+
+# ============================================================================
+# SSE Streaming Endpoint for Agentic Search Progress
+# ============================================================================
+
+@router.post(
+    "/intelligent/stream",
+    summary="Agentic search with live progress via Server-Sent Events",
+    description=(
+        "Runs the intelligent search and streams progress updates in real-time. "
+        "For non-agentic queries the stream emits a single event with the results. "
+        "Connect with EventSource on the frontend."
+    ),
+)
+async def intelligent_search_stream(
+    request: SearchRequest,
+    trace_id: Optional[str] = Header(None),
+):
+    """
+    SSE endpoint — each data frame is a JSON object:
+      {"type": "progress", "phase": "...", "message": "..."}
+      {"type": "results", "data": { ...SearchResponse... }}
+      {"type": "error", "detail": "..."}
+    """
+    loop = asyncio.get_running_loop()
+    event_queue: asyncio.Queue = asyncio.Queue()
+
+    def _progress_cb(phase: str, message: str) -> None:
+        """Called from the agent worker thread; puts an event on the async queue."""
+        asyncio.run_coroutine_threadsafe(
+            event_queue.put({"type": "progress", "phase": phase, "message": message}),
+            loop,
+        )
+
+    async def _event_generator():
+        yield "data: " + json.dumps({"type": "progress", "phase": "started", "message": "Search started…"}) + "\n\n"
+
+        orchestrator = get_search_orchestrator()
+        user_filter_dict = request.filters.model_dump(exclude_none=True) if request.filters else {}
+
+        # Check intent first — only agentic searches benefit from streaming.
+        # For regular/semantic we still use the streaming endpoint but progress
+        # is just start→done since they're fast.
+        def _run_search():
+            return orchestrator.search(
+                request.query,
+                request.limit,
+                request.page,
+                trace_id,
+                request.include_reasoning,
+                user_filter_dict,
+                progress_callback=_progress_cb,
+            )
+
+        search_task = loop.run_in_executor(_THREAD_POOL, _run_search)
+
+        # Drain progress events while search runs.
+        while not search_task.done():
+            try:
+                event = await asyncio.wait_for(event_queue.get(), timeout=0.5)
+                yield "data: " + json.dumps(event) + "\n\n"
+            except asyncio.TimeoutError:
+                # Heartbeat keeps connection alive during long agent runs.
+                yield ": heartbeat\n\n"
+
+        # Drain any remaining events.
+        while not event_queue.empty():
+            event = event_queue.get_nowait()
+            yield "data: " + json.dumps(event) + "\n\n"
+
+        try:
+            orch_response = await search_task
+            search_response = SearchResponse(
+                query=request.query,
+                results=[CompanyResult(**r) for r in orch_response.results],
+                metadata={
+                    "trace_id": orch_response.trace_id,
+                    "query_classification": orch_response.intent,
+                    "search_execution": orch_response.metadata.get("search_execution", {}),
+                    "total_results": len(orch_response.results),
+                    "response_time_ms": orch_response.metadata.get("response_time_ms", 0),
+                    "page": request.page,
+                    "limit": request.limit,
+                },
+                status="success",
+            )
+            yield "data: " + json.dumps({"type": "results", "data": search_response.model_dump()}) + "\n\n"
+        except Exception as exc:
+            logger.error("intelligent_search_stream_failed", error=str(exc), query=request.query[:100])
+            yield "data: " + json.dumps({"type": "error", "detail": "Search failed."}) + "\n\n"
+
+    return StreamingResponse(
+        _event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        },
+    )
 
 
 # ============================================================================

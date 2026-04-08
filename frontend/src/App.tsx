@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
 import {
   intelligentSearch,
+  intelligentSearchStream,
   getAutocompleteSuggestions,
   IntelligentSearchResponse,
   UserFilters,
@@ -577,7 +578,15 @@ function StepIcon({ state }: { state: 'done' | 'active' | 'pending' }) {
   return <span className="ai-step-icon ai-step-icon--pending">○</span>;
 }
 
-function AIThinkingPanel({ phase, isAgentic }: { phase: SearchPhase; isAgentic: boolean }) {
+function AIThinkingPanel({
+  phase,
+  isAgentic,
+  progressMessage,
+}: {
+  phase: SearchPhase;
+  isAgentic: boolean;
+  progressMessage?: string | null;
+}) {
   return (
     <div className={`ai-thinking${isAgentic ? ' ai-thinking--agentic' : ''}`}>
       <div className="ai-thinking-header">
@@ -591,7 +600,11 @@ function AIThinkingPanel({ phase, isAgentic }: { phase: SearchPhase; isAgentic: 
             {phase === 'thinking' ? '🧠 Thinking' : isAgentic ? '🤖 AI Agent Working' : '✨ AI Searching'}
           </h3>
           <p className="ai-thinking-subtitle">
-            {isAgentic ? 'Querying external data sources…' : 'Intelligently processing your query…'}
+            {progressMessage
+              ? progressMessage
+              : isAgentic
+              ? 'Querying external data sources…'
+              : 'Intelligently processing your query…'}
           </p>
         </div>
       </div>
@@ -638,6 +651,7 @@ export default function App() {
   const inputRef = useRef<HTMLInputElement>(null);
   const [results, setResults] = useState<IntelligentSearchResponse | null>(null);
   const [loading, setLoading] = useState(false);
+  const [progressMessage, setProgressMessage] = useState<string | null>(null);
   const [currentPage, setCurrentPage] = useState(1);
   const [filters, setFilters] = useState<FiltersState>(EMPTY_FILTERS);
 
@@ -746,9 +760,22 @@ export default function App() {
       setQuery(cleaned);
     }
     setLoading(true);
+    setProgressMessage(null);
     try {
       const apiFilters = toApiFilters(currentFilters);
-      const data = await intelligentSearch(cleaned, apiFilters, page, signal);
+      const data = await intelligentSearchStream(
+        cleaned,
+        apiFilters,
+        page,
+        20,
+        (evt) => {
+          if (evt.type === 'progress' && evt.message) {
+            setProgressMessage(evt.message);
+          }
+        },
+        signal,
+      );
+      setProgressMessage(null);
       setResults(data);
       setLastIntent(data.metadata?.query_classification?.category ?? 'semantic');
       // Pillar B – AI glow on filter panel for detected intent
@@ -766,8 +793,19 @@ export default function App() {
         }, 2500);
       }
     } catch (err) {
-      if (axios.isCancel(err) || (err instanceof DOMException && err.name === 'AbortError')) return;
+      setProgressMessage(null);
+      if (err instanceof DOMException && err.name === 'AbortError') return;
       console.error('Search failed:', err);
+      // Fallback to regular (non-streaming) search on stream failure
+      try {
+        const apiFilters = toApiFilters(currentFilters);
+        const data = await intelligentSearch(cleaned, apiFilters, page, signal);
+        setResults(data);
+        setLastIntent(data.metadata?.query_classification?.category ?? 'semantic');
+      } catch (fallbackErr) {
+        if (axios.isCancel(fallbackErr) || (fallbackErr instanceof DOMException && fallbackErr.name === 'AbortError')) return;
+        console.error('Fallback search also failed:', fallbackErr);
+      }
     } finally {
       if (!signal.aborted) setLoading(false);
     }
@@ -952,7 +990,7 @@ export default function App() {
         {/* Main results area */}
         <main className="results-panel">
           {loading && (
-            <AIThinkingPanel phase={searchPhase} isAgentic={lastIntent === 'agentic'} />
+            <AIThinkingPanel phase={searchPhase} isAgentic={lastIntent === 'agentic'} progressMessage={progressMessage} />
           )}
 
           {!loading && results && (

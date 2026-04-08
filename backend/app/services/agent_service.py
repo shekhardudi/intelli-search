@@ -20,8 +20,10 @@ Prompts are loaded from app/prompts/:
   - agent_extraction.txt  — event extraction system prompt
 """
 
+import concurrent.futures
 import hashlib
 import json
+import threading
 import time
 import structlog
 from datetime import date
@@ -36,6 +38,18 @@ from app.services.pii_service import detect_pii
 from app.services.prompt_loader import load_prompt
 
 logger = structlog.get_logger(__name__)
+
+# ── Thread-local storage for per-request state ───────────────────────────────
+# AgentService is a singleton — instance variables would be shared across
+# concurrent requests. Using thread-local storage ensures each request has
+# its own isolated copy of mutable per-run state.
+_tl = threading.local()
+
+# ── Circuit breakers for external dependencies ────────────────────────────────
+from app.services.circuit_breaker import CircuitBreaker, CircuitOpenError  # noqa: E402
+
+_tavily_cb = CircuitBreaker("tavily", failure_threshold=5, timeout=60.0)
+_openai_extraction_cb = CircuitBreaker("openai_extraction", failure_threshold=5, timeout=60.0)
 
 # ── Prompts loaded from disk ──────────────────────────────────────────────────
 
@@ -155,6 +169,37 @@ def _recover_partial_events(raw: str) -> list[CompanyEvent]:
     return events
 
 
+def _call_tavily(url: str, payload: dict, timeout: int) -> dict:
+    """
+    Call Tavily API with exponential-backoff retry (using tenacity) and
+    circuit-breaker protection.  Retries on transient network errors only;
+    HTTP 4xx errors are not retried.
+    """
+    import requests
+    from tenacity import (
+        retry, stop_after_attempt, wait_exponential,
+        retry_if_exception_type, before_sleep_log,
+    )
+    import logging as _logging
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=8),
+        retry=retry_if_exception_type((
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        )),
+        before_sleep=before_sleep_log(logger, _logging.WARNING),  # type: ignore[arg-type]
+        reraise=True,
+    )
+    def _do_post() -> requests.Response:
+        resp = _tavily_cb.call(requests.post, url, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        return resp
+
+    return _do_post().json()
+
+
 # ── AgentService ─────────────────────────────────────────────────────────────
 
 
@@ -188,10 +233,6 @@ class AgentService:
         self._max_company_results: int = int(_cfg.get("max_company_results", 20))
         self._tavily_prefer_original: bool = bool(_cfg.get("tavily_prefer_original_query", True))
 
-        # Original user query — stored per run so that the extraction LLM can
-        # see the user's intent even when the agent rewrites the search query.
-        self._original_query: str = ""
-
         # Plain OpenAI client used for structured event extraction.
         # Short keepalive_expiry prevents stale connections after long idle.
         import httpx as _httpx
@@ -204,9 +245,6 @@ class AgentService:
         )
         self._extraction_model = model
 
-        # Per-run company store for fallback recovery with markdown tool results.
-        self._last_run_companies: list[dict] = []
-
         # LangChain agent — imported here to keep startup fast if agentic search
         # is disabled (imports are deferred).
         self._executor = self._build_executor(openai_api_key, model, max_iterations)
@@ -215,7 +253,11 @@ class AgentService:
     # Public API
     # ------------------------------------------------------------------
 
-    def run(self, query: str) -> list[dict[str, Any]]:
+    def run(
+        self,
+        query: str,
+        progress_callback: Optional[Any] = None,
+    ) -> list[dict[str, Any]]:
         """
         Run the agent for the given query.
         Returns a list of dicts in OpenSearch-hit format so that
@@ -232,13 +274,40 @@ class AgentService:
             )
             return []
 
-        self._last_run_companies = []
-        self._original_query = query
-        _intermediate_steps: list = []  # captured for fallback even on exception
         t0 = time.perf_counter()
+        _cfg = get_search_config().get("agentic", {})
+        hard_timeout_s: int = int(_cfg.get("agent_hard_timeout_s", 90))
+
+        # Inject today's date into the user message so the agent always has the
+        # correct date even when the server runs across midnight or multiple days.
+        dated_query = f"[Today: {date.today().isoformat()}]\n{query}"
+
+        # Each request runs the executor in a dedicated thread to allow enforcing
+        # a hard wall-clock timeout independent of max_iterations.  Thread-local
+        # storage (_tl) isolates per-request mutable state across concurrent calls.
+        _intermediate_steps: list = []
+
+        def _invoke() -> dict:
+            # Initialise thread-local state for this request.
+            _tl.last_run_companies = []
+            _tl.original_query = query  # un-prefixed, used in prompts
+            _tl.progress_callback = progress_callback  # may be None
+            return self._executor.invoke({"input": dated_query})
 
         try:
-            result = self._executor.invoke({"input": query})
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_invoke)
+                try:
+                    result = future.result(timeout=hard_timeout_s)
+                except concurrent.futures.TimeoutError:
+                    logger.warning(
+                        "agent_hard_timeout",
+                        query=query[:100],
+                        timeout_s=hard_timeout_s,
+                    )
+                    # Return whatever the tools managed to collect before the timeout.
+                    return self._recover_from_steps(_intermediate_steps)
+
             _intermediate_steps = result.get("intermediate_steps", [])
             output: str = result.get("output", "")
 
@@ -290,14 +359,20 @@ class AgentService:
         from langchain.tools import StructuredTool
         from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
-        llm = ChatOpenAI(model=model, temperature=0.3, api_key=api_key)
+        _cfg = get_search_config().get("agentic", {})
+        temperature: float = float(_cfg.get("llm_temperature", 0.1))
+        llm = ChatOpenAI(model=model, temperature=temperature, api_key=api_key)
 
-        today = date.today()
+        # The system prompt contains {today}, {current_year}, {year_minus_1}
+        # placeholders. We inject a fixed date at build time for the static parts
+        # of the prompt. The *actual* current date is injected per-request via the
+        # human message prefix "[Today: ...]" in run(), which takes precedence.
+        _build_date = date.today()
         prompt = ChatPromptTemplate.from_messages([
             ("system", _SYSTEM_PROMPT_TEMPLATE.format(
-                today=today.isoformat(),
-                current_year=today.year,
-                year_minus_1=today.year - 1,
+                today=_build_date.isoformat(),
+                current_year=_build_date.year,
+                year_minus_1=_build_date.year - 1,
             )),
             ("human", "{input}"),
             MessagesPlaceholder("agent_scratchpad"),
@@ -323,43 +398,52 @@ class AgentService:
 
         # ── Tool 1: web_search_company_events ─────────────────────────
 
+        def _emit(phase: str, message: str) -> None:
+            """Emit a progress event to the streaming callback (if any)."""
+            cb = getattr(_tl, "progress_callback", None)
+            if cb is not None:
+                try:
+                    cb(phase, message)
+                except Exception:
+                    pass  # Never let progress reporting break the search
+
         def web_search_company_events(query: str) -> str:
             """
             Search the web for recent company events (funding, acquisitions,
             IPOs, layoffs, product launches) and match against the database.
             """
+            _emit("tool_start", "Searching the web for recent company events…")
             tavily_hits: list[TavilyResult] = []
 
             # Decide primary vs retry query based on config.
             # When tavily_prefer_original_query is true, Tavily gets the
             # user's natural-language query first (better for most searches);
             # the agent's keyword query becomes the zero-result fallback.
-            if svc._tavily_prefer_original and svc._original_query:
-                primary_query = svc._original_query
+            _original_query = getattr(_tl, "original_query", "")
+            if svc._tavily_prefer_original and _original_query:
+                primary_query = _original_query
                 retry_query = query  # agent's constructed query
             else:
                 primary_query = query  # agent's constructed query
-                retry_query = svc._original_query
+                retry_query = _original_query
 
             if svc._tavily_key:
                 _t_tav = time.perf_counter()
                 try:
-                    import requests
-                    resp = requests.post(
+                    data = _call_tavily(
                         "https://api.tavily.com/search",
-                        json={
+                        {
                             "api_key": svc._tavily_key,
                             "query": primary_query,
                             "max_results": svc._tavily_max_results,
                             "search_depth": svc._tavily_search_depth,
                             "include_published_date": True,
                         },
-                        timeout=svc._tavily_timeout_s,
+                        svc._tavily_timeout_s,
                     )
-                    resp.raise_for_status()
                     tavily_hits = [
                         TavilyResult.model_validate(r)
-                        for r in resp.json().get("results", [])
+                        for r in data.get("results", [])
                     ]
                     logger.info(
                         "tavily_search_done",
@@ -368,6 +452,8 @@ class AgentService:
                         titles=[h.title[:80] for h in tavily_hits],
                         tavily_ms=int((time.perf_counter() - _t_tav) * 1000),
                     )
+                except CircuitOpenError:
+                    logger.warning("tavily_circuit_open_skipping_search")
                 except Exception as e:
                     logger.warning("tavily_search_failed", error=str(e))
 
@@ -381,9 +467,12 @@ class AgentService:
                 f"Published: {r.published_date or 'unknown'}\nContent: {r.content[:1200]}"
                 for r in tavily_hits
             )
+            # Sanitize user query before embedding in LLM prompt to prevent
+            # prompt injection via crafted search queries.
+            safe_query = _original_query[:300].replace("\n", " ").replace("\r", " ")
             user_msg = (
                 f"Today: {date.today().isoformat()}\n"
-                f"Original user query: {svc._original_query}\n"
+                f"Original user query: <user_query>{safe_query}</user_query>\n"
                 f"Search query used: {primary_query}\n"
                 f"Max companies to return: {svc._max_company_results}\n\n"
                 f"Web search results:\n{results_text}"
@@ -391,7 +480,8 @@ class AgentService:
             _t_llm = time.perf_counter()
             raw = ""
             try:
-                llm_resp = svc._openai.chat.completions.create(
+                llm_resp = _openai_extraction_cb.call(
+                    svc._openai.chat.completions.create,
                     model=svc._extraction_model,
                     messages=[
                         {"role": "system", "content": _EXTRACTION_SYSTEM_PROMPT},
@@ -401,9 +491,15 @@ class AgentService:
                     temperature=0,
                     response_format={"type": "json_object"},
                 )
-                raw = llm_resp.choices[0].message.content.strip()
-                _usage = llm_resp.usage
-                finish_reason = llm_resp.choices[0].finish_reason
+                if not llm_resp.choices or not llm_resp.choices[0].message:
+                    logger.error("llm_empty_response_skipping_extraction",
+                                 model=svc._extraction_model)
+                    llm_resp = None
+                else:
+                    raw = llm_resp.choices[0].message.content or ""
+                    raw = raw.strip()
+                _usage = llm_resp.usage if llm_resp else None
+                finish_reason = llm_resp.choices[0].finish_reason if llm_resp else None
 
                 if finish_reason == "length":
                     # Output was truncated — recover complete events from partial JSON
@@ -427,6 +523,8 @@ class AgentService:
                         input_tokens=_usage.prompt_tokens if _usage else None,
                         output_tokens=_usage.completion_tokens if _usage else None,
                     )
+                    if events:
+                        _emit("extracting", f"Extracted {len(events)} company event(s) from web results…")
             except Exception as e:
                 logger.error("event_extraction_failed", error=str(e))
                 # Attempt to recover partial events from truncated JSON
@@ -451,21 +549,20 @@ class AgentService:
                 )
                 _t_retry = time.perf_counter()
                 try:
-                    retry_resp = requests.post(
+                    retry_data = _call_tavily(
                         "https://api.tavily.com/search",
-                        json={
+                        {
                             "api_key": svc._tavily_key,
                             "query": retry_query,
                             "max_results": svc._tavily_max_results,
                             "search_depth": svc._tavily_search_depth,
                             "include_published_date": True,
                         },
-                        timeout=svc._tavily_timeout_s,
+                        svc._tavily_timeout_s,
                     )
-                    retry_resp.raise_for_status()
                     retry_hits = [
                         TavilyResult.model_validate(r)
-                        for r in retry_resp.json().get("results", [])
+                        for r in retry_data.get("results", [])
                     ]
                     logger.info(
                         "tavily_retry_done",
@@ -483,12 +580,13 @@ class AgentService:
                         )
                         retry_user_msg = (
                             f"Today: {date.today().isoformat()}\n"
-                            f"Original user query: {svc._original_query}\n"
+                            f"Original user query: <user_query>{safe_query}</user_query>\n"
                             f"Search query used: {retry_query}\n"
                             f"Max companies to return: {svc._max_company_results}\n\n"
                             f"Web search results:\n{retry_text}"
                         )
-                        retry_llm = svc._openai.chat.completions.create(
+                        retry_llm = _openai_extraction_cb.call(
+                            svc._openai.chat.completions.create,
                             model=svc._extraction_model,
                             messages=[
                                 {"role": "system", "content": _EXTRACTION_SYSTEM_PROMPT},
@@ -498,8 +596,11 @@ class AgentService:
                             temperature=0,
                             response_format={"type": "json_object"},
                         )
-                        retry_raw = retry_llm.choices[0].message.content.strip()
-                        retry_finish = retry_llm.choices[0].finish_reason
+                        retry_raw = ""
+                        retry_finish = None
+                        if retry_llm.choices and retry_llm.choices[0].message:
+                            retry_raw = (retry_llm.choices[0].message.content or "").strip()
+                            retry_finish = retry_llm.choices[0].finish_reason
                         if retry_finish == "length":
                             events = _recover_partial_events(retry_raw)
                         else:
@@ -511,6 +612,8 @@ class AgentService:
                             count=len(events),
                             extraction_ms=int((time.perf_counter() - _t_retry) * 1000),
                         )
+                except CircuitOpenError:
+                    logger.warning("tavily_or_openai_circuit_open_skipping_retry")
                 except Exception as e:
                     logger.warning("extraction_retry_failed", error=str(e))
 
@@ -587,8 +690,11 @@ class AgentService:
                         )
                         resolved.append(doc.model_dump())
 
-            # Store for _recover_from_steps fallback (markdown observations aren't JSON-parseable)
-            svc._last_run_companies.extend(resolved)
+            # Store for _recover_from_steps fallback (markdown observations aren't JSON-parseable).
+            # Uses thread-local storage to avoid cross-request contamination.
+            if not hasattr(_tl, "last_run_companies"):
+                _tl.last_run_companies = []
+            _tl.last_run_companies.extend(resolved)
 
             # Return concise markdown table for the agent (saves tokens vs raw JSON)
             lines = [f"Found {len(resolved)} companies:\n"]
@@ -611,45 +717,49 @@ class AgentService:
             Look up specific companies by name in the internal database.
             Input must be a comma-separated list of company names.
             """
+            _emit("tool_start", "Looking up companies in the database…")
             names = [n.strip() for n in company_names.split(",") if n.strip()]
             results: list[dict] = []
             seen_ids: set[str] = set()
 
             for name in names:
                 matched = False
-                if svc._resolve_to_index:
-                    try:
-                        resp = svc._opensearch.search(
-                            index=svc._index,
-                            query={
-                                "multi_match": {
-                                    "query": name,
-                                    "fields": ["name^3", "domain"],
-                                    "type": "best_fields",
-                                    "fuzziness": "AUTO",
-                                }
-                            },
-                            size=svc._resolve_per_name,
-                        )
-                        for hit in resp.get("hits", {}).get("hits", []):
-                            doc_id = hit.get("_id")
-                            score = float(hit.get("_score", 0))
-                            if doc_id not in seen_ids and score > svc._min_resolve_score:
-                                seen_ids.add(doc_id)
-                                src = hit["_source"]
-                                doc = EnrichedCompanyDoc(
-                                    id=doc_id,
-                                    name=src.get("name", name),
-                                    domain=src.get("domain", ""),
-                                    industry=src.get("industry", ""),
-                                    country=src.get("country", ""),
-                                    locality=src.get("locality", ""),
-                                    score=score,
-                                )
-                                results.append(doc.model_dump())
-                                matched = True
-                    except Exception as e:
-                        logger.warning("name_lookup_failed", name=name, error=str(e))
+                # Always perform the OpenSearch lookup regardless of _resolve_to_index.
+                # _resolve_to_index controls only the auto-resolution inside
+                # web_search_company_events. This tool is explicitly invoked by the
+                # agent and must always return full indexed documents when available.
+                try:
+                    resp = svc._opensearch.search(
+                        index=svc._index,
+                        query={
+                            "multi_match": {
+                                "query": name,
+                                "fields": ["name^3", "domain"],
+                                "type": "best_fields",
+                                "fuzziness": "AUTO",
+                            }
+                        },
+                        size=svc._resolve_per_name,
+                    )
+                    for hit in resp.get("hits", {}).get("hits", []):
+                        doc_id = hit.get("_id")
+                        score = float(hit.get("_score", 0))
+                        if doc_id not in seen_ids and score > svc._min_resolve_score:
+                            seen_ids.add(doc_id)
+                            src = hit["_source"]
+                            doc = EnrichedCompanyDoc(
+                                id=doc_id,
+                                name=src.get("name", name),
+                                domain=src.get("domain", ""),
+                                industry=src.get("industry", ""),
+                                country=src.get("country", ""),
+                                locality=src.get("locality", ""),
+                                score=score,
+                            )
+                            results.append(doc.model_dump())
+                            matched = True
+                except Exception as e:
+                    logger.warning("name_lookup_failed", name=name, error=str(e))
 
                 if not matched:
                     synthetic_id = f"synthetic_{hashlib.sha256(name.encode()).hexdigest()[:16]}"
@@ -672,61 +782,58 @@ class AgentService:
             information: description, headquarters, industry, size,
             specialties, and recent updates.
             """
+            _emit("tool_start", f"Fetching LinkedIn profile for {company_name}…")
             import re as _re
-            import requests
-
             linkedin_url: Optional[str] = None
             company_doc: Optional[dict] = None
             profile_data: Optional[dict] = None
             page_content = ""
 
-            # ── Step 1: OpenSearch lookup ONLY when resolve_to_index is on ──
-            if svc._resolve_to_index:
-                try:
-                    resp = svc._opensearch.search(
-                        index=svc._index,
-                        query={
-                            "multi_match": {
-                                "query": company_name,
-                                "fields": ["name^3", "domain"],
-                                "type": "best_fields",
-                                "fuzziness": "AUTO",
-                            }
-                        },
-                        size=1,
-                    )
-                    hits = resp.get("hits", {}).get("hits", [])
-                    if hits:
-                        src = hits[0]["_source"]
-                        linkedin_url = src.get("linkedin_url")
-                        company_doc = {
-                            "id": hits[0].get("_id", ""),
-                            "name": src.get("name", company_name),
-                            "domain": src.get("domain", ""),
-                            "industry": src.get("industry", ""),
-                            "country": src.get("country", ""),
-                            "locality": src.get("locality", ""),
-                            "score": float(hits[0].get("_score", 1.0)),
+            # ── Step 1: OpenSearch lookup to get LinkedIn URL from index ──
+            try:
+                resp = svc._opensearch.search(
+                    index=svc._index,
+                    query={
+                        "multi_match": {
+                            "query": company_name,
+                            "fields": ["name^3", "domain"],
+                            "type": "best_fields",
+                            "fuzziness": "AUTO",
                         }
-                except Exception as e:
-                    logger.warning("linkedin_opensearch_lookup_failed",
-                                   name=company_name, error=str(e))
+                    },
+                    size=1,
+                )
+                hits = resp.get("hits", {}).get("hits", [])
+                if hits:
+                    src = hits[0]["_source"]
+                    linkedin_url = src.get("linkedin_url")
+                    company_doc = {
+                        "id": hits[0].get("_id", ""),
+                        "name": src.get("name", company_name),
+                        "domain": src.get("domain", ""),
+                        "industry": src.get("industry", ""),
+                        "country": src.get("country", ""),
+                        "locality": src.get("locality", ""),
+                        "score": float(hits[0].get("_score", 1.0)),
+                    }
+            except Exception as e:
+                logger.warning("linkedin_opensearch_lookup_failed",
+                               name=company_name, error=str(e))
 
             # ── Step 2: Tavily Search to discover the real LinkedIn URL ──
             if not linkedin_url and svc._tavily_key:
                 try:
-                    search_resp = requests.post(
+                    search_data = _call_tavily(
                         "https://api.tavily.com/search",
-                        json={
+                        {
                             "api_key": svc._tavily_key,
                             "query": f"{company_name} LinkedIn company page site:linkedin.com/company",
                             "max_results": 3,
                             "include_raw_content": True,
                         },
-                        timeout=svc._tavily_timeout_s,
+                        svc._tavily_timeout_s,
                     )
-                    search_resp.raise_for_status()
-                    search_results = search_resp.json().get("results", [])
+                    search_results = search_data.get("results", [])
                     for sr in search_results:
                         sr_url = sr.get("url", "")
                         if "linkedin.com/company" in sr_url:
@@ -746,6 +853,8 @@ class AgentService:
                             "linkedin_tavily_search_no_url",
                             company=company_name,
                         )
+                except CircuitOpenError:
+                    logger.warning("tavily_circuit_open_skipping_linkedin_search")
                 except Exception as e:
                     logger.warning(
                         "linkedin_tavily_search_failed",
@@ -758,16 +867,15 @@ class AgentService:
                 url = linkedin_url if linkedin_url.startswith("http") else f"https://{linkedin_url}"
                 logger.info("linkedin_attempting_scrape", company=company_name, url=url)
                 try:
-                    extract_resp = requests.post(
+                    extract_data = _call_tavily(
                         "https://api.tavily.com/extract",
-                        json={
+                        {
                             "api_key": svc._tavily_key,
                             "urls": [url],
                         },
-                        timeout=svc._tavily_timeout_s,
+                        svc._tavily_timeout_s,
                     )
-                    extract_resp.raise_for_status()
-                    extract_results = extract_resp.json().get("results", [])
+                    extract_results = extract_data.get("results", [])
                     page_content = (
                         extract_results[0].get("raw_content", "") if extract_results else ""
                     )
@@ -777,6 +885,8 @@ class AgentService:
                             company=company_name,
                             url=url,
                         )
+                except CircuitOpenError:
+                    logger.warning("tavily_circuit_open_skipping_linkedin_extract")
                 except Exception as e:
                     logger.warning(
                         "linkedin_tavily_extract_failed",
@@ -788,18 +898,17 @@ class AgentService:
             # ── Step 4: General web search fallback (about the company) ──
             if not page_content and svc._tavily_key:
                 try:
-                    fallback_resp = requests.post(
+                    fallback_data = _call_tavily(
                         "https://api.tavily.com/search",
-                        json={
+                        {
                             "api_key": svc._tavily_key,
                             "query": f"{company_name} company overview about",
                             "max_results": 3,
                             "include_raw_content": True,
                         },
-                        timeout=svc._tavily_timeout_s,
+                        svc._tavily_timeout_s,
                     )
-                    fallback_resp.raise_for_status()
-                    fallback_results = fallback_resp.json().get("results", [])
+                    fallback_results = fallback_data.get("results", [])
                     for fr in fallback_results:
                         raw_content = fr.get("raw_content") or fr.get("content", "")
                         if raw_content and len(raw_content) > 100:
@@ -815,6 +924,8 @@ class AgentService:
                             "linkedin_web_fallback_empty",
                             company=company_name,
                         )
+                except CircuitOpenError:
+                    logger.warning("tavily_circuit_open_skipping_linkedin_fallback")
                 except Exception as e:
                     logger.warning(
                         "linkedin_web_fallback_failed",
@@ -831,7 +942,8 @@ class AgentService:
                         f"LinkedIn URL: {display_url}\n\n"
                         f"Page content:\n{page_content[:3000]}"
                     )
-                    llm_resp = svc._openai.chat.completions.create(
+                    llm_resp = _openai_extraction_cb.call(
+                        svc._openai.chat.completions.create,
                         model=svc._extraction_model,
                         messages=[
                             {"role": "system", "content": _LINKEDIN_EXTRACTION_PROMPT},
@@ -841,7 +953,11 @@ class AgentService:
                         temperature=0,
                         response_format={"type": "json_object"},
                     )
-                    raw = llm_resp.choices[0].message.content.strip()
+                    if not llm_resp.choices or not llm_resp.choices[0].message:
+                        logger.error("llm_empty_response_linkedin_extraction",
+                                     company=company_name)
+                        raise ValueError("Empty LLM response")
+                    raw = (llm_resp.choices[0].message.content or "").strip()
                     profile_data = LinkedInProfile.model_validate_json(raw).model_dump()
                     logger.info(
                         "linkedin_profile_extracted",
@@ -971,19 +1087,51 @@ class AgentService:
         Last-resort fallback: collect companies from per-run store (populated by
         markdown-returning tools) and from JSON observations of other tools.
         Called when the agent did not reach submit_final_results.
+
+        Tool-aware priority order:
+          1. lookup_companies_by_name results — full indexed docs, highest quality
+          2. web_search_company_events results — from thread-local _tl.last_run_companies
+          3. Any other JSON-returning tool observations
         """
         all_companies: list[dict] = []
         seen_ids: set[str] = set()
+        lookup_companies: list[dict] = []
 
-        # Companies stored during tool execution (handles markdown observations)
-        for c in self._last_run_companies:
+        # ── Priority 1: lookup_companies_by_name JSON observations ──
+        # These are full OpenSearch docs with domain/industry/country fields.
+        for action, observation in steps:
+            tool_name = getattr(action, "tool", "") if hasattr(action, "tool") else ""
+            if tool_name != "lookup_companies_by_name":
+                continue
+            if not isinstance(observation, str):
+                continue
+            try:
+                parsed = json.loads(observation)
+                companies = parsed.get("companies", []) if isinstance(parsed, dict) else []
+                for c in companies:
+                    cid = c.get("id") or c.get("_id", "")
+                    if cid and cid not in seen_ids:
+                        seen_ids.add(cid)
+                        lookup_companies.append(c)
+            except (json.JSONDecodeError, AttributeError):
+                continue
+
+        if lookup_companies:
+            logger.info("agent_recovered_from_lookup_tool", count=len(lookup_companies))
+            all_companies.extend(lookup_companies)
+
+        # ── Priority 2: web_search results stored in thread-local ──
+        for c in getattr(_tl, "last_run_companies", []):
             cid = c.get("id") or c.get("_id", "")
             if cid and cid not in seen_ids:
                 seen_ids.add(cid)
                 all_companies.append(c)
 
-        # Also parse JSON observations from tools that still return JSON
-        for _action, observation in steps:
+        # ── Priority 3: Any other JSON tool observations ──
+        for action, observation in steps:
+            tool_name = getattr(action, "tool", "") if hasattr(action, "tool") else ""
+            if tool_name == "lookup_companies_by_name":
+                continue  # already processed above
             if not isinstance(observation, str):
                 continue
             try:

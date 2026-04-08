@@ -5,12 +5,20 @@ Allows different search backends to be plugged in based on query intent.
 import structlog
 import time
 from abc import ABC, abstractmethod
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Literal, Optional
+from pydantic import field_validator
 from pydantic import BaseModel
 from opensearchpy.exceptions import ConnectionTimeout
 from app.config import get_settings, get_search_config
 
 logger = structlog.get_logger(__name__)
+
+# Canonical set of event types — kept in sync with CompanyEvent.event_type in
+# agent_service.py so that type mismatches are caught at the Pydantic boundary.
+_VALID_EVENT_TYPES = frozenset({
+    "funding", "acquisition", "ipo", "merger", "partnership",
+    "product_launch", "expansion", "layoffs", "other",
+})
 
 
 class EventData(BaseModel):
@@ -23,6 +31,12 @@ class EventData(BaseModel):
     source_url: Optional[str] = None
 
     model_config = {"extra": "ignore", "coerce_numbers_to_str": True}
+
+    @field_validator("event_type", mode="before")
+    @classmethod
+    def _normalise_event_type(cls, v: str) -> str:
+        """Coerce unknown event types to 'other' so the field stays consistent."""
+        return v if v in _VALID_EVENT_TYPES else "other"
 
 
 class SearchResult(BaseModel):
@@ -817,7 +831,11 @@ class AgenticSearchStrategy(SearchStrategy):
         self.tools = tool_service
         self.strategy_type = "agentic"
     
-    def search(self, context: SearchContext) -> tuple[List[SearchResult], Dict[str, Any]]:
+    def search(
+        self,
+        context: SearchContext,
+        progress_callback: Optional[Any] = None,
+    ) -> tuple[List[SearchResult], Dict[str, Any]]:
         """
         Execute agentic search using external tools/APIs.
         1. Call external tool (news, funding, etc.) via ToolService
@@ -837,10 +855,10 @@ class AgenticSearchStrategy(SearchStrategy):
             query=context.query[:100],
             data_type=context.filters.get("external_data_type")
         )
-        
+
         try:
             # Call external tool — returns list of source dicts
-            external_docs = self._call_external_tool(context)
+            external_docs = self._call_external_tool(context, progress_callback=progress_callback)
             
             # Convert to SearchResult objects directly (no second OpenSearch lookup)
             results = self._docs_to_results(external_docs, context)
@@ -874,7 +892,11 @@ class AgenticSearchStrategy(SearchStrategy):
             )
             raise
     
-    def _call_external_tool(self, context: SearchContext) -> List[Dict]:
+    def _call_external_tool(
+        self,
+        context: SearchContext,
+        progress_callback: Optional[Any] = None,
+    ) -> List[Dict]:
         """Call external tool (news API, funding database, etc.)"""
         data_type = context.filters.get("external_data_type", "news")
 
@@ -891,7 +913,7 @@ class AgenticSearchStrategy(SearchStrategy):
             query=context.query[:100]
         )
 
-        return self.tools.call(data_type, context.query)
+        return self.tools.call(data_type, context.query, progress_callback=progress_callback)
 
     def _docs_to_results(self, docs: List[Dict], context: SearchContext) -> List[SearchResult]:
         """Convert ToolService source dicts directly to SearchResult objects."""
@@ -973,9 +995,10 @@ class AgenticSearchStrategy(SearchStrategy):
                 result_count=len(results),
                 filters=filters,
             )
-            # Return all results rather than an empty list — location/industry
-            # filtering is best-effort on agentic results which may lack metadata.
-            return results
+            # Return an empty list to honour the user's filter intent.
+            # Returning unfiltered results here would silently show the user
+            # companies that don't match their selected location/industry filters.
+            return []
         return filtered
 
     def get_strategy_type(self) -> str:

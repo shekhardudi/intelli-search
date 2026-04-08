@@ -137,11 +137,12 @@ class SearchOrchestrator:
         page: int = 1,
         trace_id: Optional[str] = None,
         include_reasoning: bool = True,
-        user_filters: Optional[Dict[str, Any]] = None
+        user_filters: Optional[Dict[str, Any]] = None,
+        progress_callback: Optional[Any] = None,
     ) -> IntelligentSearchResponse:
         """
         Execute intelligent search with automatic routing.
-        
+
         Args:
             query: User's search query
             limit: Results per page
@@ -150,7 +151,8 @@ class SearchOrchestrator:
             include_reasoning: Include explanation for results
             user_filters: Filters explicitly selected by the user in the UI
                           (country, state, city, industry, year_from, year_to, size_range)
-        
+            progress_callback: Optional callable(phase, message) for SSE streaming.
+
         Returns:
             IntelligentSearchResponse with results and metadata
         """
@@ -173,8 +175,16 @@ class SearchOrchestrator:
                     self.cache.track_query(query)
                     logger.info("intelligent_search_cache_hit", query=query[:100])
                     return cached_resp
-                except Exception:
-                    pass  # Corrupt/stale entry — fall through to live search
+                except Exception as _cache_err:
+                    logger.warning(
+                        "cache_entry_corrupt_evicting",
+                        key=_cache_key[:60],
+                        error=str(_cache_err),
+                    )
+                    try:
+                        self.cache.delete(_cache_key)
+                    except Exception:
+                        pass  # Best-effort eviction
 
         trace_id = trace_id or generate_trace_id()
         start_time = time.time()
@@ -248,7 +258,9 @@ class SearchOrchestrator:
             )
             
             # Step 3: Select and execute strategy
-            results, search_metadata = self._execute_strategy(intent, context)
+            results, search_metadata = self._execute_strategy(
+                intent, context, progress_callback=progress_callback
+            )
             
             # Step 4: Format response — normalize scores to [0, 1]
             max_score = max((r.relevance_score for r in results), default=1.0) or 1.0
@@ -444,26 +456,31 @@ class SearchOrchestrator:
     def _execute_strategy(
         self,
         intent: QueryIntent,
-        context: SearchContext
+        context: SearchContext,
+        progress_callback: Optional[Any] = None,
     ) -> Tuple[List[SearchResult], Dict[str, Any]]:
         """Select and execute appropriate search strategy"""
-        
+
         strategy_map = {
             SearchIntent.REGULAR: self.regular_strategy,
             SearchIntent.SEMANTIC: self.semantic_strategy,
             SearchIntent.AGENTIC: self.agentic_strategy,
         }
-        
+
         strategy = strategy_map.get(intent.category, self.semantic_strategy)
-        
+
         logger.info(
             "strategy_selected",
             trace_id=context.trace_id,
             strategy=strategy.get_strategy_type()
         )
-        
+
         try:
-            results, metadata = strategy.search(context)
+            # Pass progress_callback to agentic strategy so it reaches the agent tools.
+            if intent.category == SearchIntent.AGENTIC and progress_callback is not None:
+                results, metadata = strategy.search(context, progress_callback=progress_callback)
+            else:
+                results, metadata = strategy.search(context)
             return results, metadata
         except Exception as e:
             # Fallback: try semantic search

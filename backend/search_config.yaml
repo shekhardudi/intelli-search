@@ -73,6 +73,12 @@ agentic:
   tavily_search_depth: "advanced"
   # Tavily HTTP request timeout in seconds
   tavily_timeout_s: 8
+  # Hard wall-clock timeout (seconds) for the entire agent run.
+  # If the agent exceeds this, results collected so far are returned.
+  agent_hard_timeout_s: 90
+  # LLM temperature for the agent's reasoning model (0.0–1.0).
+  # Lower values reduce hallucination in structured extraction tasks.
+  llm_temperature: 0.1
   # When true, send the user's original natural-language query to Tavily
   # as the primary search (agent's constructed query becomes the retry).
   # When false, use the agent's keyword query first (original query is retry).

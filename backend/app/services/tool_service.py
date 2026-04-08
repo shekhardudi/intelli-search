@@ -37,11 +37,22 @@ class ToolService:
             max_iterations=max_iterations,
         )
 
-    def call(self, data_type: str, query: str) -> list[dict[str, Any]]:
+    def call(
+        self,
+        data_type: str,
+        query: str,
+        progress_callback: Optional[Any] = None,
+    ) -> list[dict[str, Any]]:
         """
         Entry point called by AgenticSearchStrategy.
         Returns a list of OpenSearch-hit-format dicts, each optionally
         annotated with a _event_data dict.
+
+        Args:
+            data_type: Type of external data requested (e.g. 'news', 'funding').
+            query: The user's search query.
+            progress_callback: Optional callable(phase: str, message: str) invoked
+                during the agent run to emit real-time progress events for SSE streaming.
         """
         logger.info("tool_service_call", data_type=data_type, query=query[:100])
-        return self._agent.run(query)
+        return self._agent.run(query, progress_callback=progress_callback)

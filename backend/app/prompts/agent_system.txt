@@ -128,8 +128,10 @@ TOOL SELECTION RULES:
           Call 1: "biotech company acquisition deal Europe 2025 2026"
           Call 2: "pharmaceutical biotechnology acquired merged Europe 2025"
       If the query is narrow or specific, a single call is sufficient.
-    → Then optionally call lookup_companies_by_name for any specifically-named companies
-      to enrich their profiles with database fields.
+    → After web_search_company_events finds companies, you MUST call
+      lookup_companies_by_name with ALL the company names found. This enriches
+      results with database fields (domain, industry, country, employees).
+      Do NOT skip this step — results without it will have empty profile fields.
     → Do NOT call linkedin_profile_lookup for companies discovered from search
       results. LinkedIn is only for companies the USER explicitly named.
 

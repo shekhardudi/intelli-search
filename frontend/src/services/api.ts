@@ -88,6 +88,89 @@ export const healthCheck = async () => {
   return response.data;
 };
 
+// ── SSE streaming search for agentic queries ───────────────────────────────
+export interface SearchProgressEvent {
+  type: 'progress' | 'results' | 'error';
+  phase?: string;
+  message?: string;
+  data?: IntelligentSearchResponse;
+  detail?: string;
+}
+
+/**
+ * Stream intelligent search via Server-Sent Events.
+ * Calls onProgress with each live event; resolves with the final results.
+ * Rejects if the server sends an error event or the connection fails.
+ */
+export function intelligentSearchStream(
+  query: string,
+  filters: UserFilters | undefined,
+  page = 1,
+  limit = 20,
+  onProgress: (event: SearchProgressEvent) => void,
+  signal?: AbortSignal,
+): Promise<IntelligentSearchResponse> {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      query,
+      limit,
+      page,
+      include_reasoning: true,
+      ...(filters && Object.values(filters).some(v => v !== undefined && v !== '') ? { filters } : {}),
+    });
+
+    fetch(`${API_BASE_URL}/api/search/intelligent/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+      body,
+      signal,
+    })
+      .then(async (res) => {
+        if (!res.ok || !res.body) {
+          reject(new Error(`Stream request failed: ${res.status}`));
+          return;
+        }
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        const pump = async () => {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() ?? '';
+            for (const line of lines) {
+              if (!line.startsWith('data: ')) continue;
+              const raw = line.slice(6).trim();
+              if (!raw) continue;
+              try {
+                const evt: SearchProgressEvent = JSON.parse(raw);
+                if (evt.type === 'results' && evt.data) {
+                  onProgress(evt);
+                  resolve(evt.data);
+                  return;
+                } else if (evt.type === 'error') {
+                  reject(new Error(evt.detail ?? 'Search stream error'));
+                  return;
+                } else {
+                  onProgress(evt);
+                }
+              } catch {
+                // Ignore malformed SSE frames
+              }
+            }
+          }
+          reject(new Error('Stream ended without results'));
+        };
+
+        pump().catch(reject);
+      })
+      .catch(reject);
+  });
+}
+
 // ── Client-side autocomplete suggestions ──────────────────────────────────
 const SUGGESTION_LIST = [
   'tech companies in California',
