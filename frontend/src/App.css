@@ -986,6 +986,36 @@ body {
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ── Agentic activity log ────────────────────────────────────────────── */
+.agentic-log {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 200px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.agentic-log-entry {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.82rem;
+  animation: step-appear 0.3s ease;
+}
+
+.agentic-log-text {
+  color: rgba(255,255,255,0.85);
+}
+
+.ai-elapsed {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: rgba(255,255,255,0.6);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
 /* =========================================================================
    Company description (LinkedIn profile)
    ========================================================================= */

@@ -243,7 +243,10 @@ class AgentService:
                 timeout=_httpx.Timeout(60.0, connect=5.0),
             ),
         )
-        self._extraction_model = model
+        # Allow extraction model to differ from the agent reasoning model.
+        # gpt-4o-mini handles the constrained json_object extraction task well and
+        # is ~70% cheaper / faster than gpt-4o — prefer it for extraction.
+        self._extraction_model = str(_cfg.get("extraction_model", model))
 
         # LangChain agent — imported here to keep startup fast if agentic search
         # is disabled (imports are deferred).
@@ -309,31 +312,11 @@ class AgentService:
                     return self._recover_from_steps(_intermediate_steps)
 
             _intermediate_steps = result.get("intermediate_steps", [])
-            output: str = result.get("output", "")
 
-            # Primary path: output is valid JSON from submit_final_results.
-            if output:
-                try:
-                    raw = json.loads(output)
-                    companies = (
-                        raw if isinstance(raw, list)
-                        else raw.get("companies", []) if isinstance(raw, dict)
-                        else []
-                    )
-                    # Only trust submit_final_results output when it has actual data.
-                    # An empty list means the agent called submit_final_results({})
-                    # or with an empty array — fall through to step recovery.
-                    if companies:
-                        return self._normalise_output(companies)
-                except json.JSONDecodeError:
-                    logger.warning(
-                        "agent_output_not_json_recovering_from_steps",
-                        output=output[:200],
-                    )
-
-            # Fallback: agent didn't produce results via submit_final_results
-            # (hit max_iterations, returned plain text, or called submit with {}).
-            # Collect every company the tools emitted during the run.
+            # Collect results from tool observations.
+            # submit_final_results has been removed — _recover_from_steps() is now
+            # the primary (not fallback) collection path, giving consistent behaviour
+            # whether the agent hit max_iterations or finished naturally.
             return self._recover_from_steps(_intermediate_steps)
 
         except Exception as e:
@@ -1066,16 +1049,9 @@ class AgentService:
                 ),
                 args_schema=LinkedInLookupInput,
             ),
-            StructuredTool.from_function(
-                func=submit_final_results,
-                name="submit_final_results",
-                description=(
-                    "Submit your final answer as a JSON array of company objects. "
-                    "This MUST be your last action — it completes the search task."
-                ),
-                args_schema=SubmitResultsInput,
-                return_direct=True,
-            ),
+            # submit_final_results has been removed — _recover_from_steps() collects
+            # results from tool observations, eliminating the need for an explicit
+            # submission step and saving one LLM turn per request.
         ]
 
     # ------------------------------------------------------------------
@@ -1084,9 +1060,11 @@ class AgentService:
 
     def _recover_from_steps(self, steps: list) -> list[dict[str, Any]]:
         """
-        Last-resort fallback: collect companies from per-run store (populated by
-        markdown-returning tools) and from JSON observations of other tools.
-        Called when the agent did not reach submit_final_results.
+        Primary result collection path: extract companies from tool observations.
+
+        Without submit_final_results, this is always how the flex agent returns
+        results — the agent's text output is ignored and tool observations are
+        used directly.
 
         Tool-aware priority order:
           1. lookup_companies_by_name results — full indexed docs, highest quality

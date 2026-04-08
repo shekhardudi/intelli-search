@@ -560,66 +560,112 @@ function extractChips(text: string): IntentChip[] {
   return chips.slice(0, 5);
 }
 
-// ── AI Thinking Panel ─────────────────────────────────────────────────────
+// ── AI Thinking Panels ────────────────────────────────────────────────────
 
-type SearchPhase = 'classifying' | 'searching' | 'thinking';
-
-const PHASE_ORDER: SearchPhase[] = ['classifying', 'searching', 'thinking'];
-
-const PHASE_META: Record<SearchPhase, { label: string; detail: string }> = {
-  classifying: { label: 'Understanding your query',  detail: 'Classifying intent with AI…'   },
-  searching:   { label: 'Searching companies',        detail: 'Scanning 500k+ companies…'     },
-  thinking:    { label: 'Thinking',                   detail: 'Analyzing and preparing results…' },
-};
-
-function StepIcon({ state }: { state: 'done' | 'active' | 'pending' }) {
-  if (state === 'done')   return <span className="ai-step-icon ai-step-icon--done">✓</span>;
-  if (state === 'active') return <span className="ai-step-icon ai-step-icon--active"><span className="ai-step-spinner" /></span>;
-  return <span className="ai-step-icon ai-step-icon--pending">○</span>;
+/** Shared orbit animation ring */
+function OrbitRing() {
+  return (
+    <div className="ai-orbit-ring">
+      <div className="ai-orbit-dot ai-orbit-dot--1" />
+      <div className="ai-orbit-dot ai-orbit-dot--2" />
+      <div className="ai-orbit-dot ai-orbit-dot--3" />
+    </div>
+  );
 }
 
-function AIThinkingPanel({
-  phase,
-  isAgentic,
-  progressMessage,
-}: {
-  phase: SearchPhase;
-  isAgentic: boolean;
+/** Neutral initial banner — shown before classification event arrives */
+function ClassifyingPanel() {
+  return (
+    <div className="ai-thinking">
+      <div className="ai-thinking-header">
+        <OrbitRing />
+        <div>
+          <h3 className="ai-thinking-title">🔍 Analyzing your query</h3>
+          <p className="ai-thinking-subtitle">Classifying intent with AI…</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Semantic search banner — compact 3-step progress driven by SSE phases */
+function SemanticThinkingPanel({ phase, progressMessage }: {
+  phase: string | null;
   progressMessage?: string | null;
 }) {
+  const steps = [
+    { key: 'classification', label: 'Intent classified' },
+    { key: 'embedding',      label: 'Generating embedding' },
+    { key: 'vector_search',  label: 'Searching vector index' },
+  ];
+  const phaseOrder = ['classification', 'embedding', 'vector_search'];
+  const currentIdx = phase ? phaseOrder.indexOf(phase) : -1;
+
   return (
-    <div className={`ai-thinking${isAgentic ? ' ai-thinking--agentic' : ''}`}>
+    <div className="ai-thinking">
       <div className="ai-thinking-header">
-        <div className="ai-orbit-ring">
-          <div className="ai-orbit-dot ai-orbit-dot--1" />
-          <div className="ai-orbit-dot ai-orbit-dot--2" />
-          <div className="ai-orbit-dot ai-orbit-dot--3" />
-        </div>
+        <OrbitRing />
         <div>
-          <h3 className="ai-thinking-title">
-            {phase === 'thinking' ? '🧠 Thinking' : isAgentic ? '🤖 AI Agent Working' : '✨ AI Searching'}
-          </h3>
+          <h3 className="ai-thinking-title">✨ AI Searching</h3>
           <p className="ai-thinking-subtitle">
-            {progressMessage
-              ? progressMessage
-              : isAgentic
-              ? 'Querying external data sources…'
-              : 'Intelligently processing your query…'}
+            {progressMessage || 'Intelligently processing your query…'}
           </p>
         </div>
       </div>
       <div className="ai-steps">
-        {PHASE_ORDER.map((p, i) => {
-          const currentIdx = PHASE_ORDER.indexOf(phase);
+        {steps.map((s, i) => {
           const state: 'done' | 'active' | 'pending' =
             i < currentIdx ? 'done' : i === currentIdx ? 'active' : 'pending';
           return (
-            <div key={p} className={`ai-step ai-step--${state}`}>
-              <StepIcon state={state} />
-              <span className="ai-step-label">{PHASE_META[p].label}</span>
-              {state === 'active' && (
-                <span className="ai-step-detail">{PHASE_META[p].detail}</span>
-              )}
+            <div key={s.key} className={`ai-step ai-step--${state}`}>
+              {state === 'done'   && <span className="ai-step-icon ai-step-icon--done">✓</span>}
+              {state === 'active' && <span className="ai-step-icon ai-step-icon--active"><span className="ai-step-spinner" /></span>}
+              {state === 'pending' && <span className="ai-step-icon ai-step-icon--pending">○</span>}
+              <span className="ai-step-label">{s.label}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/** Agentic search banner — scrolling activity log + elapsed timer */
+function AgenticThinkingPanel({ progressLogs, progressMessage, startTime }: {
+  progressLogs: string[];
+  progressMessage?: string | null;
+  startTime: number;
+}) {
+  const [elapsed, setElapsed] = useState(0);
+
+  useEffect(() => {
+    const iv = window.setInterval(() => {
+      setElapsed(Math.floor((Date.now() - startTime) / 1000));
+    }, 1000);
+    return () => clearInterval(iv);
+  }, [startTime]);
+
+  return (
+    <div className="ai-thinking ai-thinking--agentic">
+      <div className="ai-thinking-header">
+        <OrbitRing />
+        <div style={{ flex: 1 }}>
+          <h3 className="ai-thinking-title">🤖 AI Agent Researching</h3>
+          <p className="ai-thinking-subtitle">
+            {progressMessage || 'Querying external data sources…'}
+          </p>
+        </div>
+        <span className="ai-elapsed">{elapsed}s</span>
+      </div>
+      <div className="agentic-log">
+        {progressLogs.map((msg, i) => {
+          const isDone = i < progressLogs.length - 1;
+          return (
+            <div key={i} className="agentic-log-entry">
+              {isDone
+                ? <span className="ai-step-icon ai-step-icon--done">✓</span>
+                : <span className="ai-step-icon ai-step-icon--active"><span className="ai-step-spinner" /></span>}
+              <span className="agentic-log-text">{msg}</span>
             </div>
           );
         })}
@@ -658,10 +704,11 @@ export default function App() {
   // Mobile sidebar state
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
-  // AI thinking animation state
-  const [searchPhase, setSearchPhase] = useState<SearchPhase>('classifying');
-  const [lastIntent, setLastIntent] = useState('semantic');
-  const phaseIntervalRef = useRef<number | null>(null);
+  // AI thinking animation state — driven by real SSE events
+  const [lastIntent, setLastIntent] = useState<string | null>(null);
+  const [semanticPhase, setSemanticPhase] = useState<string | null>(null);
+  const [agenticLogs, setAgenticLogs] = useState<string[]>([]);
+  const agenticStartRef = useRef(Date.now());
 
   // Autocomplete state
   const [suggestions, setSuggestions] = useState<string[]>([]);
@@ -686,27 +733,6 @@ export default function App() {
     const timer = setTimeout(() => setGhostChips(extractChips(query)), 200);
     return () => clearTimeout(timer);
   }, [query]);
-
-  // Advance through search phases while loading
-  useEffect(() => {
-    if (loading) {
-      setSearchPhase('classifying');
-      let idx = 0;
-      phaseIntervalRef.current = window.setInterval(() => {
-        idx = Math.min(idx + 1, PHASE_ORDER.length - 1);
-        setSearchPhase(PHASE_ORDER[idx]);
-        if (idx === PHASE_ORDER.length - 1) clearInterval(phaseIntervalRef.current!);
-      }, 800);
-    } else {
-      if (phaseIntervalRef.current !== null) {
-        clearInterval(phaseIntervalRef.current);
-        phaseIntervalRef.current = null;
-      }
-    }
-    return () => {
-      if (phaseIntervalRef.current !== null) clearInterval(phaseIntervalRef.current);
-    };
-  }, [loading]);
 
   // Debounced autocomplete suggestions
   useEffect(() => {
@@ -761,6 +787,10 @@ export default function App() {
     }
     setLoading(true);
     setProgressMessage(null);
+    setLastIntent(null);
+    setSemanticPhase(null);
+    setAgenticLogs([]);
+    agenticStartRef.current = Date.now();
     try {
       const apiFilters = toApiFilters(currentFilters);
       const data = await intelligentSearchStream(
@@ -769,8 +799,26 @@ export default function App() {
         page,
         20,
         (evt) => {
-          if (evt.type === 'progress' && evt.message) {
-            setProgressMessage(evt.message);
+          if (evt.type === 'progress') {
+            if (evt.phase === 'classification' && evt.message) {
+              // Backend sends category as a JSON string in message
+              try {
+                const info = JSON.parse(evt.message);
+                setLastIntent(info.category ?? 'semantic');
+              } catch {
+                setLastIntent('semantic');
+              }
+            } else if (evt.phase === 'embedding' || evt.phase === 'vector_search') {
+              setSemanticPhase(evt.phase);
+              if (evt.message) setProgressMessage(evt.message);
+            } else if (evt.phase === 'tool_start' || evt.phase === 'extracting') {
+              if (evt.message) {
+                setAgenticLogs(prev => [...prev, evt.message!]);
+                setProgressMessage(evt.message);
+              }
+            } else if (evt.message) {
+              setProgressMessage(evt.message);
+            }
           }
         },
         signal,
@@ -990,7 +1038,18 @@ export default function App() {
         {/* Main results area */}
         <main className="results-panel">
           {loading && (
-            <AIThinkingPanel phase={searchPhase} isAgentic={lastIntent === 'agentic'} progressMessage={progressMessage} />
+            lastIntent === null
+              ? <ClassifyingPanel />
+              : lastIntent === 'agentic'
+                ? <AgenticThinkingPanel
+                    progressLogs={agenticLogs}
+                    progressMessage={progressMessage}
+                    startTime={agenticStartRef.current}
+                  />
+                : <SemanticThinkingPanel
+                    phase={semanticPhase}
+                    progressMessage={progressMessage}
+                  />
           )}
 
           {!loading && results && (

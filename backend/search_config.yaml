@@ -43,14 +43,15 @@ embedding:
   query_prefix: "Represent this sentence for searching relevant passages: "
 
 agentic:
-  # LLM model used by the tool-calling agent.
-  # Any OpenAI chat model that supports tool/function calling:
-  #   gpt-4o-mini  (fast, cheap, good for most queries)
-  #   gpt-4o       (best reasoning, use for complex multi-step queries)
-  #   gpt-4-turbo  (balanced)
-  model: "gpt-4o"
-  # Maximum agent iterations before giving up
-  agent_max_iterations: 5
+  # LLM model used by the flex ReAct agent (complex / named-company queries).
+  # Any OpenAI chat model that supports tool/function calling.
+  # gpt-4o-mini is sufficient for ReAct reasoning decisions and is 5-10x cheaper.
+  model: "gpt-4o-mini"
+  # Maximum agent iterations before giving up (reduced — 3 covers the full flow)
+  agent_max_iterations: 3
+  # LLM model used for event extraction (both fast pipeline and flex agent).
+  # gpt-4o-mini handles the constrained json_object format well and is fast.
+  extraction_model: "gpt-4o-mini"
   # Maximum company names the LLM may return per extraction call
   max_company_names: 25
   # Maximum company results to return from the extraction prompt
@@ -73,7 +74,13 @@ agentic:
   tavily_search_depth: "advanced"
   # Tavily HTTP request timeout in seconds
   tavily_timeout_s: 8
-  # Hard wall-clock timeout (seconds) for the entire agent run.
+  # Redis TTL (seconds) for cached Tavily results in the fast pipeline.
+  # News events don't change second-by-second — 5 minutes is safe for most queries.
+  tavily_cache_ttl_s: 300
+  # Character limit per Tavily result fed to the extraction LLM.
+  # Reducing from 1200 → 800 cuts extraction tokens and latency with minimal recall loss.
+  content_chars: 800
+  # Hard wall-clock timeout (seconds) for the entire flex agent run.
   # If the agent exceeds this, results collected so far are returned.
   agent_hard_timeout_s: 90
   # LLM temperature for the agent's reasoning model (0.0–1.0).

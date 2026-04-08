@@ -2,14 +2,19 @@
 Search Strategy Pattern - Abstract base and implementations.
 Allows different search backends to be plugged in based on query intent.
 """
+import asyncio
+import re
 import structlog
 import time
 from abc import ABC, abstractmethod
-from typing import Dict, List, Any, Literal, Optional
+from typing import Dict, List, Any, Literal, Optional, TYPE_CHECKING
 from pydantic import field_validator
 from pydantic import BaseModel
 from opensearchpy.exceptions import ConnectionTimeout
 from app.config import get_settings, get_search_config
+
+if TYPE_CHECKING:
+    from app.services.intent_classifier import QueryIntent
 
 logger = structlog.get_logger(__name__)
 
@@ -413,7 +418,7 @@ class SemanticSearchStrategy(SearchStrategy):
         self.embeddings = embedding_service
         self.strategy_type = "semantic"
 
-    def search(self, context: SearchContext) -> tuple[List[SearchResult], Dict[str, Any]]:
+    def search(self, context: SearchContext, progress_callback=None) -> tuple[List[SearchResult], Dict[str, Any]]:
         """
         Execute semantic search.
 
@@ -423,14 +428,14 @@ class SemanticSearchStrategy(SearchStrategy):
         """
         mode = get_search_config().get("semantic", {}).get("mode", "knn")
         if mode == "rrf":
-            return self._search_rrf(context)
-        return self._search_knn(context)
+            return self._search_rrf(context, progress_callback=progress_callback)
+        return self._search_knn(context, progress_callback=progress_callback)
 
     # ------------------------------------------------------------------
     # Pure k-NN path
     # ------------------------------------------------------------------
 
-    def _search_knn(self, context: SearchContext) -> tuple[List[SearchResult], Dict[str, Any]]:
+    def _search_knn(self, context: SearchContext, progress_callback=None) -> tuple[List[SearchResult], Dict[str, Any]]:
         """Pure k-NN vector search with automatic BM25 fallback on timeout.
 
         With 7M vectors on a single node the HNSW graph can be slow to
@@ -438,6 +443,13 @@ class SemanticSearchStrategy(SearchStrategy):
         times out, we transparently fall back to a BM25 lexical search
         so the user still gets results.
         """
+        def _emit(phase: str, message: str) -> None:
+            if progress_callback is not None:
+                try:
+                    progress_callback(phase, message)
+                except Exception:
+                    pass
+
         start_time = time.time()
 
         logger.info(
@@ -449,6 +461,7 @@ class SemanticSearchStrategy(SearchStrategy):
 
         try:
             # --- Step 1: Generate embedding ---
+            _emit("embedding", "Generating vector embedding…")
             embed_start = time.time()
             try:
                 embedding = self.embeddings.embed(context.optimized_query)
@@ -470,6 +483,7 @@ class SemanticSearchStrategy(SearchStrategy):
             )
 
             # --- Step 2: Execute kNN query ---
+            _emit("vector_search", "Searching vector index…")
             knn_start = time.time()
             try:
                 knn_body = self._build_knn_query(context, embedding)
@@ -603,8 +617,15 @@ class SemanticSearchStrategy(SearchStrategy):
     # RRF hybrid path
     # ------------------------------------------------------------------
 
-    def _search_rrf(self, context: SearchContext) -> tuple[List[SearchResult], Dict[str, Any]]:
+    def _search_rrf(self, context: SearchContext, progress_callback=None) -> tuple[List[SearchResult], Dict[str, Any]]:
         """Hybrid search using Reciprocal Rank Fusion (BM25 + k-NN)."""
+        def _emit(phase: str, message: str) -> None:
+            if progress_callback is not None:
+                try:
+                    progress_callback(phase, message)
+                except Exception:
+                    pass
+
         start_time = time.time()
 
         logger.info(
@@ -615,7 +636,10 @@ class SemanticSearchStrategy(SearchStrategy):
         )
 
         try:
+            _emit("embedding", "Generating vector embedding…")
             embedding = self.embeddings.embed(context.optimized_query)
+
+            _emit("vector_search", "Running hybrid BM25 + vector search…")
 
             rrf_cfg = get_search_config().get("rrf", {})
             fetch_size = max(context.limit * rrf_cfg.get("fetch_multiplier", 4), 100)
@@ -822,73 +846,211 @@ class AgenticSearchStrategy(SearchStrategy):
     """
     Bucket 3: External Path - Tool-based search for time-sensitive/external data.
     Best for: Recent news, funding, events, etc.
-    Uses ReAct agent pattern with external tools.
+
+    Routes between two paths:
+      Fast path  — deterministic async pipeline (AgenticPipeline) for ~85% of queries:
+                   event-type queries without a specific named company.
+                   2 LLM calls (both gpt-4o-mini), parallel Tavily, batch msearch.
+      Flex path  — LangChain ReAct agent for complex/named-company queries:
+                   LinkedIn lookups, multi-hop reasoning, specific company profiles.
     """
-    
-    def __init__(self, opensearch_service, tool_service):
-        """Initialize with OpenSearch and tool service"""
+
+    # Event types that qualify for the fast deterministic pipeline.
+    # Queries about these types follow a predictable search → extract → resolve pattern.
+    _FAST_PATH_TYPES = frozenset({
+        "funding", "ipo", "acquisition", "layoffs", "expansion",
+        "product_launch", "merger", "partnership", "news",
+    })
+
+    # Detects a specific named company in the query.
+    # Triggers flex path (ReAct agent handles LinkedIn + named-company enrichment).
+    _NAMED_COMPANY_RE = re.compile(
+        r'"[^"]{3,50}"'                                         # "Stripe Inc" — quoted name
+        r'|\b(?:about|for|regarding|on)\s+[A-Z][a-z]+'         # "about Stripe" — title-case after preposition
+        r'|\b[A-Z][a-zA-Z0-9]+(?:\s+[A-Z][a-zA-Z0-9]+){0,2}'
+        r'\s+(?:Inc\.?|LLC|Ltd\.?|Corp\.?|GmbH|Plc|PLC'        # "Stripe Inc/Ltd" — with legal suffix
+        r'|inc\.?|llc|ltd\.?|corp\.?|gmbh|plc)\b',
+    )
+
+    # Detects LinkedIn / detailed profile requests → always flex path.
+    _LINKEDIN_RE = re.compile(
+        r'\blinkedin\b|\bprofile\b|\bdetails?\s+(?:about|of|for)\b',
+        re.IGNORECASE,
+    )
+
+    def __init__(self, opensearch_service, tool_service, pipeline=None):
+        """
+        Args:
+            opensearch_service: OpenSearch client wrapper.
+            tool_service:       ToolService wrapping the ReAct agent (flex path).
+            pipeline:           Optional AgenticPipeline for the fast deterministic path.
+                                Pass None to disable fast path and always use flex agent.
+        """
         self.opensearch = opensearch_service
         self.tools = tool_service
+        self.pipeline = pipeline  # AgenticPipeline | None
         self.strategy_type = "agentic"
-    
+
     def search(
         self,
         context: SearchContext,
+        intent: Optional["QueryIntent"] = None,
         progress_callback: Optional[Any] = None,
     ) -> tuple[List[SearchResult], Dict[str, Any]]:
         """
-        Execute agentic search using external tools/APIs.
-        1. Call external tool (news, funding, etc.) via ToolService
-        2. ToolService returns full OpenSearch source dicts already resolved
-        3. Convert directly to SearchResult objects
-        4. Apply any remaining user filters as post-processing
+        Execute agentic search, routing to the fast pipeline or flex agent.
+
+        Fast path  — async deterministic pipeline via asyncio.run()
+                     (safe: this method runs in a thread pool, not the event loop)
+        Flex path  — existing LangChain ReAct agent (unchanged)
         """
         from app.config import get_settings
         if not get_settings().ENABLE_AGENTIC_SEARCH:
             raise NotImplementedError("Agentic search is disabled via ENABLE_AGENTIC_SEARCH setting")
 
+        if intent and self.pipeline and self._should_use_fast_path(context.query, intent):
+            return self._run_fast_path(context, intent, progress_callback)
+        return self._run_flex_path(context, progress_callback)
+
+    # ------------------------------------------------------------------
+    # Routing helpers
+    # ------------------------------------------------------------------
+
+    def _should_use_fast_path(self, query: str, intent: "QueryIntent") -> bool:
+        """
+        Return True when the fast deterministic pipeline is appropriate.
+
+        Fast path requires:
+          1. external_data_type is a supported event type
+          2. No specific named company detected (agent handles those via LinkedIn)
+          3. No LinkedIn / profile request detected
+        """
+        if intent.external_data_type not in self._FAST_PATH_TYPES:
+            return False
+        if self._NAMED_COMPANY_RE.search(query):
+            return False
+        if self._LINKEDIN_RE.search(query):
+            return False
+        return True
+
+    # ------------------------------------------------------------------
+    # Fast path — deterministic async pipeline
+    # ------------------------------------------------------------------
+
+    def _run_fast_path(
+        self,
+        context: SearchContext,
+        intent: "QueryIntent",
+        progress_callback: Optional[Any],
+    ) -> tuple[List[SearchResult], Dict[str, Any]]:
+        """
+        Run the AgenticPipeline via asyncio.run().
+
+        asyncio.run() is safe here because this method executes in a worker
+        thread (via FastAPI's run_in_executor), not inside the event loop.
+        Falls back to the flex ReAct agent on any pipeline error.
+        """
         start_time = time.time()
 
         logger.info(
-            "agentic_search_started",
+            "agentic_fast_path_started",
             trace_id=context.trace_id,
             query=context.query[:100],
-            data_type=context.filters.get("external_data_type")
+            external_data_type=intent.external_data_type,
+        )
+
+        try:
+            external_docs = asyncio.run(
+                self.pipeline.run(
+                    query=context.query,
+                    intent=intent,
+                    progress_callback=progress_callback,
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "agentic_fast_path_failed_falling_back_to_flex",
+                trace_id=context.trace_id,
+                error=str(exc),
+            )
+            return self._run_flex_path(context, progress_callback)
+
+        results = self._docs_to_results(external_docs, context)
+        results = self._apply_post_filters(results, context)
+
+        execution_time = time.time() - start_time
+        metadata = {
+            "strategy": self.strategy_type,
+            "path": "fast_pipeline",
+            "external_tool_used": context.filters.get("external_data_type"),
+            "external_results": len(external_docs),
+            "matching_companies": len(results),
+            "execution_time_ms": int(execution_time * 1000),
+            "score_range": self._get_score_range(results),
+        }
+
+        logger.info(
+            "agentic_fast_path_completed",
+            trace_id=context.trace_id,
+            **metadata,
+        )
+        return results, metadata
+
+    # ------------------------------------------------------------------
+    # Flex path — ReAct agent (unchanged from previous implementation)
+    # ------------------------------------------------------------------
+
+    def _run_flex_path(
+        self,
+        context: SearchContext,
+        progress_callback: Optional[Any],
+    ) -> tuple[List[SearchResult], Dict[str, Any]]:
+        """
+        Execute agentic search using the LangChain ReAct agent.
+        Used for complex / named-company / LinkedIn queries.
+        """
+        start_time = time.time()
+
+        logger.info(
+            "agentic_flex_path_started",
+            trace_id=context.trace_id,
+            query=context.query[:100],
+            data_type=context.filters.get("external_data_type"),
         )
 
         try:
             # Call external tool — returns list of source dicts
             external_docs = self._call_external_tool(context, progress_callback=progress_callback)
-            
+
             # Convert to SearchResult objects directly (no second OpenSearch lookup)
             results = self._docs_to_results(external_docs, context)
-            
+
             # Apply user filters as post-processing (narrow down results)
             results = self._apply_post_filters(results, context)
 
             execution_time = time.time() - start_time
             metadata = {
                 "strategy": self.strategy_type,
+                "path": "flex_agent",
                 "external_tool_used": context.filters.get("external_data_type"),
                 "external_results": len(external_docs),
                 "matching_companies": len(results),
                 "execution_time_ms": int(execution_time * 1000),
-                "score_range": self._get_score_range(results)
+                "score_range": self._get_score_range(results),
             }
-            
+
             logger.info(
-                "agentic_search_completed",
+                "agentic_flex_path_completed",
                 trace_id=context.trace_id,
-                **metadata
+                **metadata,
             )
-            
             return results, metadata
-            
+
         except Exception as e:
             logger.error(
                 "agentic_search_failed",
                 trace_id=context.trace_id,
-                error=str(e)
+                error=str(e),
             )
             raise
     

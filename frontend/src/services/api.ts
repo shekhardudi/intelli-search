@@ -95,6 +95,9 @@ export interface SearchProgressEvent {
   message?: string;
   data?: IntelligentSearchResponse;
   detail?: string;
+  /** Populated when phase === 'classification' (message is a JSON string) */
+  category?: string;
+  confidence?: number;
 }
 
 /**
