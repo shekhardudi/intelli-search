@@ -25,32 +25,95 @@ Output format is compatible with AgenticSearchStrategy._docs_to_results():
 import asyncio
 import hashlib
 import json
+import re as _re
 import structlog
 import time
 from datetime import date
-from typing import Any, Optional, TYPE_CHECKING
+from pathlib import Path
+from typing import Any, Literal, Optional, TYPE_CHECKING
 
 from openai import AsyncOpenAI
+from pydantic import BaseModel
 
 from app.config import get_settings, get_search_config
-from app.services.agent_service import (
-    CompanyEvent,
-    EventExtractionResponse,
-    EventData,
-    TavilyResult,
-    _call_tavily,
-    _recover_partial_events,
-    _EXTRACTION_SYSTEM_PROMPT,
-)
-from app.services.circuit_breaker import CircuitOpenError
 from app.services.pii_service import detect_pii
+from app.services.search_strategies import EventData
+from app.services.tavily_client import TavilyClient
 
 if TYPE_CHECKING:
     from app.services.intent_classifier import QueryIntent
 
 logger = structlog.get_logger(__name__)
 
-_TAVILY_URL = "https://api.tavily.com/search"
+# ── Boundary models (formerly in agent_service) ──────────────────────────────
+
+
+class TavilyResult(BaseModel):
+    """Validated Tavily Search API result item."""
+    title: str = ""
+    url: str = ""
+    content: str = ""
+    published_date: Optional[str] = ""
+
+    model_config = {"extra": "ignore", "coerce_numbers_to_str": True}
+
+
+class CompanyEvent(BaseModel):
+    """Structured company event extracted from web search by the LLM."""
+    company_name: str
+    event_type: Literal[
+        "funding", "acquisition", "ipo", "merger", "partnership",
+        "product_launch", "expansion", "layoffs", "other"
+    ]
+    amount: Optional[str] = None
+    round: Optional[str] = None
+    date: Optional[str] = None
+    country: Optional[str] = None
+    city: Optional[str] = None
+    summary: str = ""
+    source_url: Optional[str] = None
+
+    model_config = {"extra": "ignore"}
+
+
+class EventExtractionResponse(BaseModel):
+    """Full validated LLM extraction output."""
+    events: list[CompanyEvent] = []
+
+
+class LinkedInProfile(BaseModel):
+    """Structured company profile extracted from LinkedIn page."""
+    description: Optional[str] = None
+    headquarters: Optional[str] = None
+    industry: Optional[str] = None
+    company_size: Optional[str] = None
+    specialties: list[str] = []
+    founded_year: Optional[int] = None
+    website: Optional[str] = None
+    recent_updates: Optional[str] = None
+
+    model_config = {"extra": "ignore"}
+
+
+# ── Prompts loaded from disk (formerly in agent_service) ─────────────────────
+
+_PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
+
+_EXTRACTION_SYSTEM_PROMPT: str = (_PROMPTS_DIR / "agent_extraction.txt").read_text(encoding="utf-8")
+_LINKEDIN_EXTRACTION_PROMPT: str = (_PROMPTS_DIR / "agent_linkedin_extraction.txt").read_text(encoding="utf-8")
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _recover_partial_events(raw: str) -> list[CompanyEvent]:
+    """Try to salvage complete events from truncated JSON output."""
+    events: list[CompanyEvent] = []
+    for m in _re.finditer(r'\{[^{}]*"company_name"\s*:[^{}]+\}', raw):
+        try:
+            events.append(CompanyEvent.model_validate_json(m.group()))
+        except Exception:
+            continue
+    return events
 
 
 class AgenticPipeline:
@@ -70,18 +133,17 @@ class AgenticPipeline:
         cfg = get_search_config().get("agentic", {})
         self._opensearch = opensearch_service
         self._index = get_settings().OPENSEARCH_INDEX_NAME
-        self._tavily_key = tavily_key
         self._cache = cache_service
         self._embeddings = embedding_service
 
         # Config — read from search_config.yaml with sensible defaults
         self._max_results: int = int(cfg.get("tavily_max_results", 6))
-        self._search_depth: str = str(cfg.get("tavily_search_depth", "advanced"))
+        self._search_depth: str = str(cfg.get("tavily_search_depth", "basic"))
         self._timeout_s: int = int(cfg.get("tavily_timeout_s", 8))
         self._cache_ttl_s: int = int(cfg.get("tavily_cache_ttl_s", 300))
         self._content_chars: int = int(cfg.get("content_chars", 800))
-        self._resolve_per_name: int = int(cfg.get("resolve_per_name", 2))
-        self._min_resolve_score: float = float(cfg.get("min_resolve_score", 1.0))
+        self._resolve_per_name: int = int(cfg.get("resolve_per_name", 5))
+        self._min_resolve_score: float = float(cfg.get("min_resolve_score", 0.5))
         # When False, _batch_resolve skips OpenSearch entirely and returns synthetic
         # docs with event data only — mirrors agent_service's resolve_to_index flag.
         self._resolve_to_index: bool = bool(cfg.get("resolve_to_index", True))
@@ -89,8 +151,27 @@ class AgenticPipeline:
         self._llm_max_tokens: int = int(cfg.get("llm_max_tokens", 2048))
         self._extraction_model: str = str(cfg.get("extraction_model", "gpt-4o-mini"))
 
+        # LinkedIn enrichment knobs (Phase 3)
+        _li_cfg = cfg.get("linkedin", {}) if isinstance(cfg.get("linkedin"), dict) else {}
+        self._linkedin_max_companies: int = int(_li_cfg.get("max_companies", 3))
+        self._linkedin_content_chars: int = int(_li_cfg.get("content_chars", 3000))
+        self._linkedin_llm_max_tokens: int = int(_li_cfg.get("llm_max_tokens", 600))
+
+        # Semantic prefetch knobs (Phase 4)
+        _sp_cfg = cfg.get("semantic_prefetch", {}) if isinstance(cfg.get("semantic_prefetch"), dict) else {}
+        self._semantic_prefetch_k: int = int(_sp_cfg.get("k", 50))
+        self._semantic_prefetch_size: int = int(_sp_cfg.get("size", 20))
+
         # Async OpenAI client — one per pipeline instance, connection-pooled
         self._openai = AsyncOpenAI(api_key=openai_api_key)
+
+        # Tavily client — owns breaker + retry; methods return {} on failure.
+        self._tavily = TavilyClient(
+            api_key=tavily_key,
+            timeout_s=self._timeout_s,
+            search_depth=self._search_depth,
+            max_results=self._max_results,
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -122,6 +203,35 @@ class AgenticPipeline:
                     pass
 
         t0 = time.perf_counter()
+
+        # Phase 0 — LinkedIn enrichment branch.
+        # When the classifier identifies specific named companies the user
+        # cares about, prefer the per-company enrichment path. We still run
+        # event extraction afterwards so funding/news context can attach to
+        # the same companies, but if enrichment yields results we return
+        # them as the authoritative answer (matches the old flex-path behaviour).
+        named_companies = list(getattr(intent, "named_companies", []) or [])
+        if named_companies:
+            _emit(
+                "enriching",
+                f"Looking up LinkedIn profile(s) for {len(named_companies)} company(ies)…",
+            )
+            enriched = await self._enrich_named_companies(named_companies)
+            if enriched:
+                logger.info(
+                    "pipeline_linkedin_enriched",
+                    query=query[:80],
+                    requested=len(named_companies),
+                    enriched=len(enriched),
+                    total_ms=int((time.perf_counter() - t0) * 1000),
+                )
+                return enriched
+            logger.info(
+                "pipeline_linkedin_no_results_falling_back_to_events",
+                query=query[:80],
+                companies=named_companies,
+            )
+
         primary_q = intent.search_query or query
         secondary_q = self._build_secondary_query(query, primary_q)
 
@@ -202,7 +312,7 @@ class AgenticPipeline:
         Fire primary and secondary Tavily searches simultaneously.
         Deduplicate by URL — primary results take precedence.
         """
-        if not self._tavily_key:
+        if not self._tavily.enabled:
             return []
 
         if secondary_q:
@@ -241,10 +351,9 @@ class AgenticPipeline:
 
     async def _tavily_search(self, query: str) -> list[TavilyResult]:
         """
-        Single Tavily search with Redis caching + circuit-breaker + retry.
-
-        Runs the synchronous _call_tavily() in a thread via asyncio.to_thread
-        so it doesn't block the event loop.
+        Single Tavily search with Redis caching, via the shared TavilyClient
+        (which owns the circuit breaker, retry policy, and asyncio.to_thread
+        offload). Returns ``[]`` on any failure or breaker-open state.
         """
         # ── Cache lookup ──
         cache_key = self._tavily_cache_key(query)
@@ -259,31 +368,16 @@ class AgenticPipeline:
                 except Exception:
                     pass  # Corrupt cache — re-fetch
 
-        # ── Tavily API call (in thread to avoid blocking event loop) ──
-        payload = {
-            "api_key": self._tavily_key,
-            "query": query,
-            "max_results": self._max_results,
-            "search_depth": self._search_depth,
-            "include_published_date": True,
-        }
-        try:
-            data = await asyncio.to_thread(
-                _call_tavily, _TAVILY_URL, payload, self._timeout_s
-            )
-            # Cache the raw response for future requests
-            if self._cache:
-                try:
-                    self._cache.set(cache_key, json.dumps(data), ttl=self._cache_ttl_s)
-                except Exception:
-                    pass
-            return [TavilyResult.model_validate(r) for r in data.get("results", [])]
-        except CircuitOpenError:
-            logger.warning("pipeline_tavily_circuit_open", query=query[:80])
+        # ── Tavily API call (TavilyClient handles breaker + retry + threading) ──
+        data = await self._tavily.asearch(query)
+        if not data:
             return []
-        except Exception as exc:
-            logger.warning("pipeline_tavily_failed", query=query[:80], error=str(exc))
-            return []
+        if self._cache:
+            try:
+                self._cache.set(cache_key, json.dumps(data), ttl=self._cache_ttl_s)
+            except Exception:
+                pass
+        return [TavilyResult.model_validate(r) for r in data.get("results", [])]
 
     def _tavily_cache_key(self, query: str) -> str:
         """Deterministic Redis key for a Tavily query."""
@@ -538,12 +632,12 @@ class AgenticPipeline:
                         "knn": {
                             "vector_embedding": {
                                 "vector": embedding,
-                                "k": 20,
+                                "k": self._semantic_prefetch_k,
                             }
                         }
                     }
                 },
-                size=20,
+                size=self._semantic_prefetch_size,
             )
             results: list[dict] = []
             for hit in response.get("hits", {}).get("hits", []):
@@ -564,3 +658,179 @@ class AgenticPipeline:
         except Exception as exc:
             logger.warning("pipeline_semantic_prefetch_failed", error=str(exc))
             return []
+
+    # ------------------------------------------------------------------
+    # LinkedIn enrichment (Phase 3) — replaces the LangChain
+    # ``linkedin_profile_lookup`` tool. One async coroutine per company,
+    # all run concurrently with ``asyncio.gather``. Sync HTTP and
+    # synchronous OpenSearch calls are wrapped at the leaf via
+    # ``asyncio.to_thread`` so the event loop stays responsive.
+    # ------------------------------------------------------------------
+
+    async def _enrich_named_companies(self, company_names: list[str]) -> list[dict]:
+        """Resolve up to ``linkedin.max_companies`` named companies to enriched docs.
+
+        Output dicts use the same shape as ``_batch_resolve`` so the existing
+        ``_docs_to_results`` consumer needs no changes — the only difference
+        is the ``_linkedin_profile`` field replacing ``_event_data``.
+        """
+        if not company_names:
+            return []
+        names = company_names[: self._linkedin_max_companies]
+        results = await asyncio.gather(
+            *(self._enrich_one_company(name) for name in names),
+            return_exceptions=True,
+        )
+        out: list[dict] = []
+        seen: set[str] = set()
+        for name, res in zip(names, results):
+            if isinstance(res, BaseException):
+                logger.warning(
+                    "pipeline_linkedin_enrich_failed",
+                    company=name,
+                    error=str(res),
+                )
+                continue
+            if not res:
+                continue
+            doc_id = res.get("_id")
+            if doc_id and doc_id not in seen:
+                seen.add(doc_id)
+                out.append(res)
+        return out
+
+    async def _enrich_one_company(self, company_name: str) -> Optional[dict]:
+        """Discover URL → scrape → LLM-extract a single LinkedIn profile."""
+        linkedin_url: Optional[str] = None
+        company_doc: Optional[dict] = None
+        page_content = ""
+
+        # Step 1: OpenSearch lookup for an indexed linkedin_url
+        try:
+            resp = await asyncio.to_thread(
+                self._opensearch.search,
+                index=self._index,
+                body={
+                    "query": {
+                        "multi_match": {
+                            "query": company_name,
+                            "fields": ["name^3", "domain"],
+                            "type": "best_fields",
+                            "fuzziness": "AUTO",
+                        }
+                    }
+                },
+                size=1,
+            )
+            hits = resp.get("hits", {}).get("hits", [])
+            if hits:
+                src = hits[0].get("_source", {})
+                linkedin_url = src.get("linkedin_url")
+                company_doc = {
+                    "_id": hits[0].get("_id", ""),
+                    "_score": float(hits[0].get("_score", 1.0)),
+                    "name": src.get("name", company_name),
+                    "domain": src.get("domain", ""),
+                    "industry": src.get("industry", ""),
+                    "country": src.get("country", ""),
+                    "locality": src.get("locality", ""),
+                }
+        except Exception as exc:
+            logger.warning(
+                "pipeline_linkedin_opensearch_lookup_failed",
+                company=company_name,
+                error=str(exc),
+            )
+
+        # Step 2: Tavily search to discover the LinkedIn URL
+        if not linkedin_url and self._tavily.enabled:
+            search_data = await self._tavily.asearch(
+                f"{company_name} LinkedIn company page site:linkedin.com/company",
+                max_results=3,
+                include_raw_content=True,
+            )
+            for sr in search_data.get("results", []):
+                sr_url = sr.get("url", "")
+                if "linkedin.com/company" in sr_url:
+                    linkedin_url = sr_url
+                    raw = sr.get("raw_content") or sr.get("content", "")
+                    if raw and len(raw) > 100:
+                        page_content = raw
+                    break
+
+        # Step 3: Tavily extract on the discovered URL
+        if linkedin_url and not page_content and self._tavily.enabled:
+            url = (
+                linkedin_url
+                if linkedin_url.startswith("http")
+                else f"https://{linkedin_url}"
+            )
+            extract_data = await self._tavily.aextract(url)
+            extract_results = extract_data.get("results", [])
+            page_content = (
+                extract_results[0].get("raw_content", "") if extract_results else ""
+            )
+
+        # Step 4: General-web fallback when LinkedIn is unreachable
+        if not page_content and self._tavily.enabled:
+            fb = await self._tavily.asearch(
+                f"{company_name} company overview about",
+                max_results=3,
+                include_raw_content=True,
+            )
+            for fr in fb.get("results", []):
+                raw = fr.get("raw_content") or fr.get("content", "")
+                if raw and len(raw) > 100:
+                    page_content = raw
+                    break
+
+        # Step 5: LLM extraction
+        profile_data: Optional[dict] = None
+        if page_content:
+            try:
+                user_msg = (
+                    f"Company: {company_name}\n"
+                    f"LinkedIn URL: {linkedin_url or 'not found'}\n\n"
+                    f"Page content:\n{page_content[: self._linkedin_content_chars]}"
+                )
+                llm_resp = await self._openai.chat.completions.create(
+                    model=self._extraction_model,
+                    messages=[
+                        {"role": "system", "content": _LINKEDIN_EXTRACTION_PROMPT},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    max_tokens=self._linkedin_llm_max_tokens,
+                    temperature=0,
+                    response_format={"type": "json_object"},
+                )
+                if llm_resp.choices and llm_resp.choices[0].message:
+                    raw = (llm_resp.choices[0].message.content or "").strip()
+                    profile_data = LinkedInProfile.model_validate_json(raw).model_dump()
+            except Exception as exc:
+                logger.warning(
+                    "pipeline_linkedin_llm_extraction_failed",
+                    company=company_name,
+                    error=str(exc),
+                )
+
+        # Build the enriched doc; same shape as _batch_resolve outputs
+        if company_doc:
+            result = dict(company_doc)
+        else:
+            synthetic_id = (
+                f"synthetic_{hashlib.sha256(company_name.encode()).hexdigest()[:16]}"
+            )
+            result = {
+                "_id": synthetic_id,
+                "_score": 1.0,
+                "name": company_name,
+                "domain": "",
+                "industry": "",
+                "country": "",
+                "locality": "",
+            }
+        if profile_data:
+            result["_linkedin_profile"] = profile_data
+        if linkedin_url:
+            result["linkedin_url"] = linkedin_url
+        return result

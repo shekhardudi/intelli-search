@@ -43,13 +43,7 @@ embedding:
   query_prefix: "Represent this sentence for searching relevant passages: "
 
 agentic:
-  # LLM model used by the flex ReAct agent (complex / named-company queries).
-  # Any OpenAI chat model that supports tool/function calling.
-  # gpt-4o-mini is sufficient for ReAct reasoning decisions and is 5-10x cheaper.
-  model: "gpt-4o-mini"
-  # Maximum agent iterations before giving up (reduced — 3 covers the full flow)
-  agent_max_iterations: 3
-  # LLM model used for event extraction (both fast pipeline and flex agent).
+  # LLM model used for event extraction (deterministic pipeline).
   # gpt-4o-mini handles the constrained json_object format well and is fast.
   extraction_model: "gpt-4o-mini"
   # Maximum company names the LLM may return per extraction call
@@ -71,7 +65,7 @@ agentic:
   # Tavily web-search max results (only used when TAVILY_API_KEY is set)
   tavily_max_results: 6
   # Tavily search depth: "basic" (fast, shallow) or "advanced" (deeper, slower)
-  tavily_search_depth: "advanced"
+  tavily_search_depth: "basic"
   # Tavily HTTP request timeout in seconds
   tavily_timeout_s: 8
   # Redis TTL (seconds) for cached Tavily results in the fast pipeline.
@@ -80,13 +74,17 @@ agentic:
   # Character limit per Tavily result fed to the extraction LLM.
   # Reducing from 1200 → 800 cuts extraction tokens and latency with minimal recall loss.
   content_chars: 800
-  # Hard wall-clock timeout (seconds) for the entire flex agent run.
-  # If the agent exceeds this, results collected so far are returned.
-  agent_hard_timeout_s: 90
-  # LLM temperature for the agent's reasoning model (0.0–1.0).
-  # Lower values reduce hallucination in structured extraction tasks.
-  llm_temperature: 0.1
-  # When true, send the user's original natural-language query to Tavily
-  # as the primary search (agent's constructed query becomes the retry).
-  # When false, use the agent's keyword query first (original query is retry).
-  tavily_prefer_original_query: true
+
+  # LinkedIn enrichment branch (used when intent.named_companies is non-empty).
+  linkedin:
+    # Cap on number of named companies enriched in parallel per request.
+    max_companies: 3
+    # Max characters of LinkedIn page content fed to the extraction LLM.
+    content_chars: 3000
+    # Token budget for the LinkedIn extraction LLM call.
+    llm_max_tokens: 600
+
+  # Semantic prefetch fallback (when Tavily returns nothing).
+  semantic_prefetch:
+    k: 50
+    size: 10

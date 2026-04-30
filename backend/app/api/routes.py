@@ -4,9 +4,7 @@ Uses the new orchestrator-based architecture with intent classification,
 strategy routing, and hybrid search.
 """
 import asyncio
-import functools
 import json
-from concurrent.futures import ThreadPoolExecutor
 from fastapi import APIRouter, Query, HTTPException, Header, Response
 from fastapi.responses import StreamingResponse
 from typing import Any, Callable, Dict, List, Optional
@@ -20,8 +18,6 @@ from app.observability import log_search_execution
 import time as _time
 from app.observability.metrics import get_search_metrics
 logger = structlog.get_logger(__name__)
-
-_THREAD_POOL = ThreadPoolExecutor(max_workers=128)
 
 router = APIRouter(prefix="/api/search", tags=["search"])
 
@@ -176,17 +172,15 @@ async def intelligent_search(
                 has_filters=bool(user_filter_dict),
                 filters=user_filter_dict,
             )
-            _search_fn = functools.partial(
-                orchestrator.search,
-                request.query,
-                request.limit,
-                request.page,
-                trace_id,
-                request.include_reasoning,
-                user_filter_dict,
-            )
             orch_response = await asyncio.wait_for(
-                asyncio.get_running_loop().run_in_executor(_THREAD_POOL, _search_fn),
+                orchestrator.search(
+                    request.query,
+                    request.limit,
+                    request.page,
+                    trace_id,
+                    request.include_reasoning,
+                    user_filter_dict,
+                ),
                 timeout=get_settings().SEARCH_TIMEOUT,
             )
         except asyncio.TimeoutError:
@@ -275,11 +269,15 @@ async def intelligent_search_stream(
     event_queue: asyncio.Queue = asyncio.Queue()
 
     def _progress_cb(phase: str, message: str) -> None:
-        """Called from the agent worker thread; puts an event on the async queue."""
-        asyncio.run_coroutine_threadsafe(
-            event_queue.put({"type": "progress", "phase": phase, "message": message}),
-            loop,
-        )
+        """Progress sink — called from the same loop the search runs on.
+
+        ``put_nowait`` is safe because the queue is unbounded and we are
+        already on the event-loop thread. No cross-thread bridging needed.
+        """
+        try:
+            event_queue.put_nowait({"type": "progress", "phase": phase, "message": message})
+        except Exception:
+            pass  # Never let a SSE failure break the search.
 
     async def _event_generator():
         yield "data: " + json.dumps({"type": "progress", "phase": "started", "message": "Search started…"}) + "\n\n"
@@ -287,11 +285,9 @@ async def intelligent_search_stream(
         orchestrator = get_search_orchestrator()
         user_filter_dict = request.filters.model_dump(exclude_none=True) if request.filters else {}
 
-        # Check intent first — only agentic searches benefit from streaming.
-        # For regular/semantic we still use the streaming endpoint but progress
-        # is just start→done since they're fast.
-        def _run_search():
-            return orchestrator.search(
+        # Run the search as a regular task on this loop — no thread pool.
+        search_task = asyncio.create_task(
+            orchestrator.search(
                 request.query,
                 request.limit,
                 request.page,
@@ -300,8 +296,7 @@ async def intelligent_search_stream(
                 user_filter_dict,
                 progress_callback=_progress_cb,
             )
-
-        search_task = loop.run_in_executor(_THREAD_POOL, _run_search)
+        )
 
         # Drain progress events while search runs.
         while not search_task.done():
@@ -460,5 +455,5 @@ async def get_index_stats():
     from app.config import get_settings
     settings = get_settings()
     os_service = get_opensearch_service()
-    stats = os_service.get_index_stats(settings.OPENSEARCH_INDEX)
-    return {"index": settings.OPENSEARCH_INDEX, **stats}
+    stats = os_service.get_index_stats(settings.OPENSEARCH_INDEX_NAME)
+    return {"index": settings.OPENSEARCH_INDEX_NAME, **stats}

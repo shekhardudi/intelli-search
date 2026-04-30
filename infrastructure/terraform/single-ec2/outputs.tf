@@ -47,3 +47,21 @@ output "run_ingestion_command" {
   description = "Trigger data ingestion"
   value       = "aws autoscaling set-desired-capacity --auto-scaling-group-name ${aws_autoscaling_group.ingest.name} --desired-capacity 1 --region ${var.aws_region}"
 }
+
+# ---------------------------------------------------------------------------
+# CloudFront
+# ---------------------------------------------------------------------------
+output "cloudfront_domain_name" {
+  description = "CloudFront distribution domain name (HTTPS)"
+  value       = var.enable_cloudfront ? aws_cloudfront_distribution.app[0].domain_name : null
+}
+
+output "cloudfront_url" {
+  description = "Application URL via CloudFront (HTTPS)"
+  value       = var.enable_cloudfront ? "https://${aws_cloudfront_distribution.app[0].domain_name}" : null
+}
+
+output "cloudfront_distribution_id" {
+  description = "CloudFront distribution ID (for cache invalidation)"
+  value       = var.enable_cloudfront ? aws_cloudfront_distribution.app[0].id : null
+}

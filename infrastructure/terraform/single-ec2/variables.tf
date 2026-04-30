@@ -40,3 +40,9 @@ variable "allowed_ssh_cidr" {
   type        = string
   default     = "0.0.0.0/0"
 }
+
+variable "enable_cloudfront" {
+  description = "Create a CloudFront distribution in front of the app (adds HTTPS + CDN caching)"
+  type        = bool
+  default     = false
+}
